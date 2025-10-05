@@ -4,7 +4,7 @@
 
 ;; Author: Andrew Hyatt <ahyatt@gmail.com>
 ;; Homepage: https://github.com/ahyatt/ekg
-;; Package-Requires: ((triples "0.5.1") (emacs "28.1") (llm "0.18.0"))
+;; Package-Requires: ((triples "0.6.1") (emacs "28.1") (llm "0.18.0"))
 ;; Keywords: outlines, hypermedia
 ;; Version: 0.8.0
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -168,11 +168,6 @@ which are applied to each non-standard property in turn."
   "Template for displaying one-line notes in a note buffer.
 Otherwise the same format as `ekg-display-note-template'")
 
-(defcustom ekg-metadata-separator-text "--text follows this line--"
-  "Separator between the metadata of the note and the note text."
-  :type 'string
-  :group 'ekg)
-
 (defcustom ekg-notes-display-images t
   "Whether images are displayed by default."
   :type 'boolean
@@ -214,11 +209,6 @@ links out of them, as well as adding them to the note text."
   :type 'boolean
   :group 'ekg)
 
-(defcustom ekg-command-regex-for-narrowing '("^org-insert" "org-meta-return")
-  "A list of regex for commands which need a narrowed buffer."
-  :type '(repeat string)
-  :group 'ekg)
-
 (defconst ekg-db-file-obsolete (file-name-concat user-emacs-directory "ekg.db")
   "The original database name that ekg started with.")
 
@@ -255,33 +245,8 @@ backups in your database after it has been created, run
     (((type tty))) :underline t)
   "Face shown for EKG resource.")
 
-(defface ekg-metadata
-  '((default :inherit default :weight bold))
-  "Face shown for the metadata section of notes.")
-
 (defvar ekg-db nil
   "Live sqlite database connection.")
-
-(defvar ekg-metadata-parsers '(("Tags" . ekg--metadata-update-tag)
-                               ("Resource" . ekg--metadata-update-resource)
-                               ("Title" . ekg--metadata-update-title))
-  "Functions that update a note from the buffer's metadata text.
-Each function takes its field's property value and updates the
-buffer's `ekg-note' with the results of parsing that value.  The
-function takes one argument, a list of the field metadata
-property values for multivalue types, or a single one for single
-value types.  If `ekg-property-multivalue-type' has an entry, it
-is a multivalue type.")
-
-(defconst ekg-property-multivalue-type '(("Tags" . comma)
-                                         ("Title" . line))
-  "Defines per typehow multiple values are separated.
-The values are symbols, COMMA means a comma-separated value.
-LINE means each value gets its own property line.")
-
-(defvar ekg-metadata-labels '((:titled/title . "Title"))
-  "Alist of properties that can be on the note and their labels.
-The label needs to match the keys in the `ekg-metadata-parsers' alist.")
 
 (defvar ekg-add-schema-hook nil
   "Hook run when ensuring schema for ekg.
@@ -405,16 +370,28 @@ callers have already called this function")
   ;; A URL can be a subject too, and has data, including the title. The title is
   ;; something that can be used to select the subject via completion.
   (triples-add-schema ekg-db 'titled '(title :base/type string))
+
+  (triples-add-schema ekg-db 'ekg-property '(name :base/type string :base/unique t))
+  (triples-set-type ekg-db 'tagged/tag 'ekg-property :name "Tags")
+  (triples-set-type ekg-db 'titled/title 'ekg-property :name "Title")
+
+  ;; The `ekg-note-type' type is a signifier that the type is safe to delete
+  ;; when a note is deleted.
+  (triples-add-schema ekg-db 'ekg-note-type)
+  (dolist (type '(text time-tracked inline titled tagged))
+    (triples-set-type ekg-db type 'ekg-note-type))
+
   (triples-add-schema ekg-db 'ekg '(version :base/type cons :base/unique t))
+
   (run-hooks 'ekg-add-schema-hook))
 
-(defvar ekg-schema-text-cotypes '(text tagged time-tracked titled)
-  "All the types that are used in the ekg schema on text entities.
-Extensions can add to this list, but should not remove from it.
-Any type here in considered owned by ekg and will be removed
-during note deletion.
-
-These are not guaranteed to be only on text entities, however.")
+(defun ekg-property-name-for (prop)
+  "Return the human-readable name for property PROP (such as :tagged/tag).
+If there is no name, return the symbol converted to a string (without the colon)."
+  (ekg-connect)
+  (let ((decoloned-prop (triples--decolon prop)))
+    (or (plist-get (triples-get-type ekg-db decoloned-prop 'ekg-property) :name)
+        (symbol-name decoloned-prop))))
 
 (defun ekg--generate-id ()
   "Return a unique ID for a note.
@@ -602,13 +579,17 @@ If the ID does not exist, create a new note with that ID."
   "Delete NOTE from the database."
   (ekg-note-delete-by-id (ekg-note-id note)))
 
+(defun ekg-note-cotypes ()
+  "Return the list of triple types that are owned by notes."
+  (triples-subjects-of-type ekg-db 'ekg-note-type))
+
 (defun ekg-note-delete-by-id (id)
   "Delete all note data associated with ID."
   (ekg-connect)
   (run-hook-with-args 'ekg-note-pre-delete-hook id)
   (triples-with-transaction
     ekg-db
-    (cl-loop for type in ekg-schema-text-cotypes do
+    (cl-loop for type in (ekg-note-cotypes) do
              (triples-remove-type ekg-db id type))
     (cl-loop for inline-id in (triples-subjects-with-predicate-object
                                ekg-db 'inline/for-text id)
@@ -978,15 +959,13 @@ ARG is the prefix argument, if used it opens in another window."
   "Set some common local variables."
   (setq-local
    completion-at-point-functions
-   (append (list #'ekg--capf #'ekg--transclude-titled-note-completion
+   (append (list #'ekg--transclude-titled-note-completion
                  #'ekg--inline-tag-completion)
            completion-at-point-functions)
    kill-buffer-query-functions
    (append (list #'ekg--kill-buffer-query-function)
            kill-buffer-query-functions)
    header-line-format (ekg--header-line-format))
-  (add-hook 'pre-command-hook #'ekg-narrow-for-command nil t)
-  (add-hook 'post-command-hook #'ekg-unnarrow-for-command nil t)
 
   (when (eq major-mode 'markdown-mode)
     (setq-local markdown-enable-wiki-links t
@@ -1003,6 +982,11 @@ ARG is the prefix argument, if used it opens in another window."
     (define-key map "\C-c\C-c" #'ekg-capture-finalize)
     (define-key map "\C-c\C-k" #'ekg-capture-abort)
     (define-key map "\C-c#" #'ekg-edit-add-inline)
+    (define-key map "\C-c\C-p" #'ekg-note-edit-property)
+    (define-key map "\C-c+" #'ekg-note-add-tag)
+    (define-key map "\C-c-" #'ekg-note-remove-tag)
+    (define-key map "\C-c\C-t+" #'ekg-note-add-title)
+    (define-key map "\C-c\C-t-" #'ekg-note-remove-title)
     (substitute-key-definition #'save-buffer #'ekg-save-draft map global-map)
     map)
   "Key map for `ekg-capture-mode', a minor mode.
@@ -1022,6 +1006,11 @@ This is used when capturing new notes.")
   (let ((map (make-sparse-keymap)))
     (define-key map "\C-c\C-c" #'ekg-edit-finalize)
     (define-key map "\C-c#" #'ekg-edit-add-inline)
+    (define-key map "\C-c\C-p" #'ekg-note-edit-property)
+    (define-key map "\C-c+" #'ekg-note-add-tag)
+    (define-key map "\C-c-" #'ekg-note-remove-tag)
+    (define-key map "\C-c\C-t+" #'ekg-note-add-title)
+    (define-key map "\C-c\C-t-" #'ekg-note-remove-title)
     (substitute-key-definition #'save-buffer #'ekg-edit-save map global-map)
     map)
   "Key map for `ekg-edit-mode', a minor mode.
@@ -1031,7 +1020,8 @@ This is used when editing existing notes.")
   "Minor mode for simple finish/cancel keybindings."
   :init-value nil
   :lighter " EKG-ED"
-  :interactive nil)
+  :interactive nil
+  (ekg--set-local-variables))
 
 (defvar-local ekg-note nil
   "Holds the note information for buffers adding or changing notes.")
@@ -1042,16 +1032,6 @@ This is used when editing existing notes.")
 (defvar-local ekg-note-orig-id nil
   "Holds the original ID (subject) for this note.
 This is needed to identify references to refresh when the subject is changed.")
-
-(defvar-local ekg-note-orig-fields nil
-  "Holds the fields that were populated when the note was loaded.")
-
-(defvar-local ekg-note-auto-narrowed nil
-  "If we are currently in an auto-narrowed state.
-This happens when a command is run that likely needs to see a
-narrowed part of the buffer.  It is only non-nil when running a
-command that needs to be narrowed for it, and it is needed so we
-can keep track of whether we need to unnarrow or not.")
 
 (defvar ekg-notes-mode-map
   (let ((map (make-keymap)))
@@ -1082,44 +1062,42 @@ can keep track of whether we need to unnarrow or not.")
         (define-key ekg-notes-mode-map "\C-c\C-o" #'org-open-at-point))))
 
 (defun ekg--header-line-format ()
-  "Header line format for the ekg capture or edit buffer."
-  (if ekg-capture-mode
-      (substitute-command-keys
-       "\\<ekg-capture-mode-map>Capture buffer. \
-Finish `\\[ekg-capture-finalize]'  \
-Save as draft `\\[ekg-save-draft]'  \
-Abort and delete draft `\\[ekg-capture-abort]'.")
-    (substitute-command-keys
-     "\\<ekg-edit-mode-map>Edit buffer. \
-Finish `\\[ekg-edit-finalize]'  \
-Save `\\[ekg-edit-save]'")))
+  "Generate header line format showing note metadata, constrained by window width."
+  (when ekg-note
+    (let ((window-width (window-width (get-buffer-window (current-buffer))))
+          (parts '())
+          (commands-part (concat " | "
+                                 (substitute-command-keys
+                                  "\\<ekg-edit-mode-map>\\[ekg-edit-finalize] finish"))))
+      ;; Always add commands part
+      (push commands-part parts)
+      (setq remaining-width (- window-width (length commands-part)))
 
-(defun ekg-narrow-for-command ()
-  "Narrow buffer if the command requires it.
-This is based on `ekg-command-regex-for-narrowing'."
-  (condition-case err
-      (when (and
-             (not ekg-note-auto-narrowed)
-             (seq-some
-              (lambda (s) (string-match-p s (symbol-name this-command)))
-              ekg-command-regex-for-narrowing))
-        (narrow-to-region (1+ (overlay-end (ekg--metadata-overlay)))
-                          (point-max))
-        ;; execute-extended-command will then call another command, and we need
-        ;; to also possibly narrow for that.
-        (unless (eq this-command 'execute-extended-command)
-          (setq ekg-note-auto-narrowed t)))
-    (error (lwarn :error 'ekg "Error narrowing for command: %s"
-                  (error-message-string err)))))
+      ;; Add tags if present
+      (when (ekg-note-tags ekg-note)
+        (let ((tags-part (concat (propertize "Tags: " 'face 'bold)
+                                 (mapconcat #'identity (ekg-note-tags ekg-note) ", "))))
+          (push (ekg-truncate-at tags-part remaining-width) parts)
+          (cl-decf remaining-width (length tags-part))))
 
-(defun ekg-unnarrow-for-command ()
-  "Unnarrow the buffer if it was automatically narrowed."
-  (condition-case err
-      (when ekg-note-auto-narrowed
-        (widen)
-        (setq ekg-note-auto-narrowed nil))
-    (error (lwarn :error 'ekg "Error unnarrowing for command: %s"
-                  (error-message-string err)))))
+      ;; Add all other properties
+      (map-do (lambda (prop value)
+                (push (ekg-truncate-at
+                       (concat (propertize (ekg-property-name-for prop) 'face 'bold)
+                               ": "
+                               (if (listp value)
+                                   (mapconcat #'identity value ", ")
+                                 (format "%s" value)))
+                       remaining-width) parts))
+              (ekg-note-properties ekg-note))
+
+      ;; Add resource if meaningful
+      (when (ekg-should-show-id-p (ekg-note-id ekg-note))
+        (let ((resource-part (concat (propertize "Resource: " 'face 'bold)
+                                     (format "%s" (ekg-note-id ekg-note)))))
+          (push (ekg-truncate-at resource-part remaining-width) parts)))
+
+      (mapconcat #'identity parts "  "))))
 
 (defun ekg--possible-inline-tags-prefix-regexp ()
   "Return a regexp of the possible inline tag prefixes."
@@ -1190,7 +1168,7 @@ non-nil."
       (setf (ekg-note-text note) (buffer-substring-no-properties (point-min) (point-max))))))
 
 (defun ekg--populate-inline-tags (note)
-  "Populate tags found in text of NOTE.
+  "Populae tags found in text of NOTE.
 Tags are prefixed by a hash symbol or a symbol in
 `ekg-inline-custom-tag-completion-symbols', and are enclosed in brackets
 if they have more than one word.  They aso can be org or markdown links,
@@ -1316,149 +1294,13 @@ displayed.")
                    :modified-time time
                    :properties properties)))
 
-(defun ekg--metadata-string-to-tag (s)
-  "Return string S as a tag."
-  (replace-regexp-in-string (rx ?\") "" s))
-
-(defun ekg--metadata-string (property value)
-  "Return a representation of PROPERTY with VALUE for the metadata.
-This will be displayed at the top of the note buffer."
-  (let ((read-only (string= property "Tags")))
-    (format "%s%s%s"
-            (concat
-             (propertize (concat property ":") 'face 'bold 'read-only read-only)
-             (propertize " " 'read-only nil 'rear-nonsticky t))
-            value
-            (propertize "\n" 'read-only read-only 'rear-nonsticky t))))
-
 (defun ekg-should-show-id-p (id)
   "Return non-nil if the note ID should be shown to the user.
 True when the ID represents a meaningful resource to the user,
 rather than an auto-generated number."
   (not (numberp id)))
 
-(defun ekg--replace-metadata ()
-  "Replace the metadata in a buffer."
-  (let ((note ekg-note))
-    (with-temp-buffer
-      (when (ekg-should-show-id-p (ekg-note-id note))
-        (insert (ekg--metadata-string "Resource" (ekg-note-id note))))
-      (insert
-       (ekg--metadata-string "Tags"
-                             (mapconcat (lambda (tag) (format "%s" tag))
-                                        (ekg-note-tags note) ", ")))
-      (map-apply (lambda (k v)
-                   (when-let ((label (assoc-default k ekg-metadata-labels)))
-                     (if (listp v)
-                         (pcase (assoc-default label ekg-property-multivalue-type)
-                           ('line (cl-loop for val in v do
-                                           (insert (ekg--metadata-string label val))))
-                           ('comma (insert (ekg--metadata-string
-                                            label
-                                            (if (listp v)
-                                                (mapconcat (lambda (v) (format "%s" v))
-                                                           v ", ")
-                                              (format "%s" v))))))
-                       (insert (ekg--metadata-string label v)))))
-                 (ekg-note-properties note))
-      (buffer-string))))
 
-(defun ekg--metadata-overlay ()
-  "Return the overlay used for metadata."
-  (or (car (seq-filter
-            (lambda (o) (eq 'ekg-metadata (overlay-get o 'category)))
-            (overlays-in (point-min) (point-max))))
-      (make-overlay (point-min) (point-max) nil nil t)))
-
-(defun ekg--metadata-on-insert-behind (_ after begin-mod end-mod &optional _)
-  "Make sure nothing is inserted behind the metadata overlay.
-Also make sure we always have a line with which the user can add text.
-
-AFTER is non-nil if the text is to be insert afterwards.
-BEGIN-MOD is the beginning of the modification, and END-MOD is
-the end."
-  (when after
-    (delete-region begin-mod end-mod)
-    (when (= (point) (point-max))
-      (insert "\n"))))
-
-(defun ekg--metadata-modification (overlay after _ _ &optional _)
-  "Make sure the metadata region doesn't interfere with editing.
-This function is called on modification within the metadata.
-
-BEGIN-MOD and END-MOD are the beginning and end points of the
-modification by the user.
-
-We want to make sure of a few things:
-  1) The user isn't adding more than one empty line.
-
-  2) There is at least one non-metadata line in the buffer.
-Argument OVERLAY is the overlay whose modification triggers this
-method.  Argument AFTER is non-nil if method is being called
-after the modification.
-
-  3) The user can't delete the metadata - if the user tries to
-delete from the end of the metadata, we need to fix it back up."
-  (when after
-    (ekg-detect-tag-completion)
-    ;; If we're at the end of the metadata, we need to make sure we don't delete
-    ;; it from the previous line. Moving after is also suspicious, because we
-    ;; don't know where to move it. It's easiest and clearest if we just do
-    ;; nothing.
-    (save-excursion
-      (forward-line -1)
-      (while (looking-at (rx (seq line-start (zero-or-more space) line-end)))
-        (if (fboundp 'delete-line)
-            (delete-line)
-          (progn
-            (beginning-of-line)
-            (kill-line)
-            (kill-line)))
-        (forward-line -1)))
-    (when (= (overlay-end overlay)
-             (buffer-end 1))
-      (let ((p (point)))
-        (goto-char (buffer-end 1))
-        ;; Walk backward until we get to content
-        (while (looking-at (rx (seq line-start (zero-or-more space) line-end)))
-          (forward-line -1))
-        (forward-line)
-        (setq p (point))
-        (delete-region (point) (overlay-end overlay))
-        (insert "\n")
-        (move-overlay overlay (overlay-start overlay) p)))
-    ;; Make sure the overlay ends on a newline, if not, insert one.
-    (when
-        (save-excursion
-          (goto-char (- (overlay-end overlay) 1))
-          (unless (looking-at "\n")
-            (forward-char 1)
-            (insert "\n")
-            t ;; Return true if we inserted a newline.
-            ))
-      (goto-char (overlay-end overlay)))))
-
-(defun ekg-edit-display-metadata ()
-  "Create or edit the overlay to show metadata."
-  (let ((o (ekg--metadata-overlay))
-        (inhibit-read-only t))
-    (buffer-disable-undo)
-    (replace-region-contents (overlay-start o) (overlay-end o)
-                             #'ekg--replace-metadata)
-    (goto-char (overlay-end o))
-    (insert "\n")
-    (move-overlay o (point-min) (- (overlay-end o) 1))
-    (overlay-put o 'after-string (propertize (concat ekg-metadata-separator-text "\n")
-                                             'read-only t 'rear-nonsticky t))
-    (overlay-put o 'category 'ekg-metadata)
-    (overlay-put o 'modification-hooks '(ekg--metadata-modification))
-    (overlay-put o 'insert-behind-hooks '(ekg--metadata-on-insert-behind))
-    (overlay-put o 'face 'ekg-metadata)
-    (overlay-put o 'local-map global-map)
-    (buffer-enable-undo)
-    ;; If org-mode is on, the metadata messes up the org-element-cache, so let's disable it.
-    (when (eq major-mode 'org-mode)
-      (setq-local org-element-use-cache nil))))
 
 ;;;###autoload
 (cl-defun ekg-capture (&key text mode tags properties id)
@@ -1472,19 +1314,18 @@ If ID is given, force the triple subject to be that value."
          (tags (seq-uniq (append tags auto-tags))))
     (set-buffer buf)
     (funcall (or mode ekg-capture-default-mode))
-    (ekg-capture-mode 1)
     (setq ekg-note
           (ekg-note-create :id id
                            :text text
                            :mode mode
                            :tags tags
                            :properties properties))
-    (ekg-edit-display-metadata)
-    (goto-char (point-max))
+    (ekg-capture-mode 1)
     (mapc (lambda (tag) (run-hook-with-args 'ekg-note-add-tag-hook tag))
           (ekg-note-tags ekg-note))
     (mapc #'ekg-maybe-function-tag (ekg-note-tags ekg-note))
     (insert text)
+    (goto-char (point-min))
     (if (and (eq mode 'org-mode)
              ekg-notes-display-images)
         (condition-case nil
@@ -1536,6 +1377,124 @@ file.  If not, an error will be thrown."
     (ekg--set-local-variables)
     (setq ekg-note note)))
 
+(defun ekg-note-available-properties (note)
+  "Given an ekg NOTE, return a list of all applicable properties."
+
+  ;; For now, we don't use the information in NOTE to decide what properties it
+  ;; has, but we probably will need to do this in the future.
+  (triples-subjects-of-type ekg-db 'ekg-property))
+
+(defun ekg-note-edit-property ()
+  "Edit a property of the current note.
+If the property is a multiple-value property, the user will be able to
+edit it as a comma separated list."
+  (interactive nil ekg-capture-mode ekg-edit-mode)
+  (unless ekg-note
+    (error "No note to edit"))
+  (let* ((property-alist (cons (cons "Resource" 'resource)
+                               (mapcar (lambda (prop)
+                                         (cons (ekg-property-name-for prop)
+                                               prop))
+                                       (ekg-note-available-properties ekg-note))))
+         (property (assoc (completing-read "Property to edit: " property-alist nil t)
+                          property-alist))
+         (property-single-valued (plist-get (triples-get-type ekg-db (cdr property) 'base) :unique))
+         (current-value (pcase (cdr property)
+                          ('resource (format "%s" (ekg-note-id ekg-note)))
+                          ('tagged/tag (ekg-note-tags ekg-note))
+                          (_ (plist-get (ekg-note-properties ekg-note) (cdr property)))))
+         (new-value (read-string (format "%s: " (car property))
+                                 (if (listp current-value)
+                                     (mapconcat #'identity current-value ", ")
+                                   current-value))))
+    (unless (eq (not property-single-valued)
+                (listp current-value))
+      (error "Property %s must be %s-valued" (car property)
+             (if property-single-valued "single" "multi")))
+    (pcase (cdr property)
+      ('resource
+       (setf (ekg-note-id ekg-note)
+             (if (string-empty-p new-value)
+                 (ekg--generate-id)
+               new-value)))
+      ('tagged/tag
+       (setf (ekg-note-tags ekg-note)
+             (if (string-empty-p new-value)
+                 nil
+               (seq-uniq (split-string new-value ", " t "[[:space:]]*")))))
+      (_ (setf (ekg-note-properties ekg-note)
+               (plist-put (ekg-note-properties ekg-note)
+                          (cdr property)
+                          (if property-single-valued
+                              new-value
+                            (split-string new-value ", " t "[[:space:]]*"))))))
+    (setq header-line-format (ekg--header-line-format))
+    (message "Property %s updated" (car property))))
+
+(defun ekg-note-add-tag (tag)
+  "Add TAG to the current note.
+TAG can be nil, and the user will be prompted for the tag."
+  (interactive nil ekg-capture-mode ekg-edit-mode)
+  (unless ekg-note
+    (error "No note to edit"))
+  (let ((new-tag (or tag
+                     (completing-read "Add tag: "
+                                      (seq-difference (ekg-tags)
+                                                      (ekg-note-tags ekg-note))))))
+    (when (and new-tag (not (string-empty-p new-tag)))
+      (push (ekg--normalize-tag new-tag) (ekg-note-tags ekg-note))
+      (setf (ekg-note-tags ekg-note) (seq-uniq (ekg-note-tags ekg-note)))
+      (run-hook-with-args 'ekg-note-add-tag-hook new-tag)
+      (ekg-maybe-function-tag new-tag)
+      (setq header-line-format (ekg--header-line-format))
+      (message "Tag '%s' added" new-tag))))
+
+(defun ekg-note-remove-tag (tag)
+  "Remove TAG from the current note.
+
+TAG can be nil and the user will be prompted for the tag."
+  (interactive nil ekg-capture-mode ekg-edit-mode)
+  (unless ekg-note
+    (error "No note to edit"))
+  (when (ekg-note-tags ekg-note)
+    (let ((tag-to-remove (or tag (completing-read "Remove tag: "
+                                                  (ekg-note-tags ekg-note) nil t))))
+      (setf (ekg-note-tags ekg-note)
+            (seq-difference (ekg-note-tags ekg-note) (list tag-to-remove)))
+      (setq header-line-format (ekg--header-line-format))
+      (message "Tag '%s' removed" tag-to-remove))))
+
+(defun ekg-note-add-title ()
+  "Add a title to the current note."
+  (interactive nil ekg-capture-mode ekg-edit-mode)
+  (unless ekg-note
+    (error "No note to edit"))
+  (let ((new-title (read-string "Add title: ")))
+    (when (and new-title (not (string-empty-p new-title)))
+      (let ((current-titles (plist-get (ekg-note-properties ekg-note)
+                                       :titled/title)))
+        (setf (ekg-note-properties ekg-note)
+              (plist-put (ekg-note-properties ekg-note)
+                         :titled/title
+                         (append current-titles (list new-title))))
+        (setq header-line-format (ekg--header-line-format))
+        (message "Title '%s' added" new-title)))))
+
+(defun ekg-note-remove-title ()
+  "Remove a title from the current note."
+  (interactive nil ekg-capture-mode ekg-edit-mode)
+  (unless ekg-note
+    (error "No note to edit"))
+  (let ((titles (plist-get (ekg-note-properties ekg-note) :titled/title)))
+    (when titles
+      (let ((title-to-remove (completing-read "Remove title: " titles nil t)))
+        (setf (ekg-note-properties ekg-note)
+              (plist-put (ekg-note-properties ekg-note)
+                         :titled/title
+                         (seq-difference titles (list title-to-remove))))
+        (setq header-line-format (ekg--header-line-format))
+        (message "Title '%s' removed" title-to-remove)))))
+
 (defun ekg-edit (note)
   "Edit an existing NOTE."
   (let ((buf (get-buffer-create (format "*EKG Edit: %s*" (ekg-note-id note)))))
@@ -1544,7 +1503,6 @@ file.  If not, an error will be thrown."
       (when (ekg-note-mode note)
         (funcall (ekg-note-mode note)))
       (ekg-edit-mode 1)
-      (ekg--set-local-variables)
       (setq-local ekg-note (copy-ekg-note note)       ; shallow copy
                   ekg-note-orig-note (copy-tree note) ; deep copy to avoid later change
                   ekg-note-orig-id (ekg-note-id note))
@@ -1552,27 +1510,23 @@ file.  If not, an error will be thrown."
       ;; so that when we save it, it's not a draft anymore.
       (setf (ekg-note-tags ekg-note)
             (seq-difference (ekg-note-tags ekg-note) (list ekg-draft-tag)))
-      (ekg-edit-display-metadata)
-      (setq-local ekg-note-orig-fields (seq-uniq
-                                        (mapcar #'car (ekg--metadata-fields note))
-                                        #'string=))
       (insert (ekg-insert-inlines-representation
                (ekg-note-text note) (ekg-note-inlines note)))
-      (goto-char (+ 1 (overlay-end (ekg--metadata-overlay))))
+      (ekg--set-local-variables)
+      (goto-char (point-min))
       (mapc #'ekg-maybe-function-tag (ekg-note-tags ekg-note))
       (if (and (eq (ekg-note-mode note) 'org-mode)
                ekg-notes-display-images)
           (org-redisplay-inline-images)))
     (set-buffer-modified-p nil)
+    (goto-char (point-min))
     (pop-to-buffer buf)))
 
 (defun ekg--save-note-in-buffer ()
   "Save the current note.
 Return the latest `ekg-note' object."
   (ekg-connect)
-  (widen)
-  (let* ((text (buffer-substring (+ 1 (overlay-end (ekg--metadata-overlay)))
-                                 (point-max)))
+  (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
          (ticons (ekg-extract-inlines text)))
     (setf (ekg-note-text ekg-note) (car ticons)
           (ekg-note-inlines ekg-note) (cdr ticons)
@@ -1599,94 +1553,9 @@ Return the latest `ekg-note' object."
     (ekg-save-note ekg-note))
   ekg-note)
 
-(defun ekg--in-metadata-p ()
-  "Whether the point is in the metadata section."
-  (< (point) (overlay-end (ekg--metadata-overlay))))
-
-(defun ekg--metadata-current-field ()
-  "Return the label and value of the current metadata property.
-If none can be found, return NIL."
-  (when (ekg--in-metadata-p)
-    (let ((line (buffer-substring (line-beginning-position) (line-end-position))))
-      (when (string-match
-             (rx (seq (group (seq (one-or-more (not ?\:))))
-                      ?\: (zero-or-more whitespace)
-                      (group (zero-or-more anychar)))) line)
-        (cons (substring-no-properties (match-string 1 line))
-              (substring-no-properties (match-string 2 line)))))))
-
-(defvar ekg-capf-field-complete-funcs
-  '(("Tags" . ekg--tags-complete))
-  "Functions to complete values in various metadata fields.
-The function is expected to behave as normal for a function in
-`completion-at-point-functions'.")
-
-(defun ekg--capf ()
-  "Completion function for all metadata at `completion-at-point-functions'.
-If no completion function is found for the field type, don't
-attempt the completion."
-  ;; Only do something when we aren't in a read-only space.
-  (when
-      (or (null (ekg--metadata-current-field))
-          ;; + 2 for the colon and space
-          (>= (current-column) (+ 2 (length (car (ekg--metadata-current-field))))))
-    (if-let (field (ekg--metadata-current-field))
-        (when-let (completion-func (assoc (car field) ekg-capf-field-complete-funcs
-                                          #'equal))
-          (funcall (cdr completion-func)))
-      ;; There's no current field, but we're in the metadata, so let's complete
-      ;; the possible fields.
-      (when (ekg--in-metadata-p)
-        (ekg--field-name-complete)))))
-
-(defun ekg--field-name-complete ()
-  "Completion function for metadata field names."
-  (list (save-excursion (beginning-of-line) (point))
-        (save-excursion (skip-chars-forward "^:\s\t\n") (point))
-        (completion-table-dynamic
-         (lambda (_)
-           ;; Complete all fields, except single-value fields (which have no
-           ;; entry in ekg-property-multivalue-type) with an existing field
-           ;; already in existence.
-           (seq-difference (mapcar #'car ekg-metadata-parsers)
-                           (seq-difference
-                            (mapcar #'car (ekg--metadata-fields nil))
-                            (mapcar #'car ekg-property-multivalue-type)))))
-        :exclusive t :exit-function (lambda (_completion finished)
-                                      (when finished (insert ": ")))))
-
-(defun ekg--tags-complete ()
-  "Completion function for tags, CAPF-style."
-  (let ((end (save-excursion
-               (skip-chars-forward "^,\t\n")
-               (point)))
-        (start (save-excursion
-                 (skip-chars-backward "^,\t\n:")
-                 ;; We are at the right boundary, but now ignore whitespace.
-                 (skip-chars-forward "\s+")
-                 (point))))
-    (list start end (completion-table-dynamic
-                     (lambda (_)
-                       (seq-difference (ekg-tags) (ekg-note-tags ekg-note))))
-          :exclusive t)))
-
-(defun ekg-detect-tag-completion ()
-  "After a modification, check if the user has completed a tag.
-If so, call the necessary hooks."
-  (let ((field (ekg--metadata-current-field)))
-    (when (equal "Tags" (car field))
-      (let ((current-tags (ekg-note-tags ekg-note)))
-        (dolist (maybe-tag (mapcar #'string-trim (split-string (cdr field) ",")))
-          (when (and (not (member maybe-tag current-tags))
-                     (member maybe-tag (ekg-tags)))
-            (ekg--update-from-metadata)
-            (run-hook-with-args 'ekg-note-add-tag-hook maybe-tag)
-            (ekg-maybe-function-tag maybe-tag)))))))
-
 (defun ekg-save-draft ()
   "Save the current note as a draft."
   (interactive nil ekg-edit-mode ekg-capture-mode)
-  (ekg--update-from-metadata)
   (when ekg-draft-tag
     (push ekg-draft-tag (ekg-note-tags ekg-note)))
   (ekg--save-note-in-buffer)
@@ -1696,7 +1565,6 @@ If so, call the necessary hooks."
 (defun ekg-edit-save ()
   "Save the edited note and refresh where it appears."
   (interactive nil ekg-edit-mode)
-  (ekg--update-from-metadata)
   (let ((note (ekg--save-note-in-buffer))
         (orig-id ekg-note-orig-id))
     (unless ekg-save-no-message
@@ -1720,65 +1588,9 @@ If so, call the necessary hooks."
   (ekg-edit-save)
   (kill-buffer))
 
-(defun ekg--split-metadata-string (val)
-  "Split multi-valued metadata field VAL into the component values.
-The metadata fields are comma separated."
-  (split-string val (rx (seq ?\, (zero-or-more space))) t (rx (1+ space))))
-
-(defun ekg--metadata-update-tag (val)
-  "Update the tag field from the metadata VAL."
-  (setf (ekg-note-tags ekg-note) val))
-
-(defun ekg--metadata-update-title (val)
-  "Update the title field from the metadata VAL."
-  (setf (ekg-note-properties ekg-note)
-        (plist-put (ekg-note-properties ekg-note) :titled/title val)))
-
-(defun ekg--metadata-update-resource (val)
-  "Update the resource to the metadata VAL."
-  (setf (ekg-note-id ekg-note) (or val (ekg--generate-id))))
-
-(defun ekg--metadata-fields (expect-valid)
-  "Return all metadata fields as a cons of labels and values.
-If EXPECT-VALID is true, warn when we encounter an unparseable field."
-  (save-excursion
-    (let ((mo (ekg--metadata-overlay))
-          (fields))
-      (goto-char (overlay-start mo))
-      (while (< (point) (overlay-end mo))
-        (if-let (field (ekg--metadata-current-field))
-            (push field fields)
-          (when expect-valid
-            (warn "EKG: No field could be parsed from metadata line at point %s" (point))))
-        (forward-line))
-      (append (reverse fields)
-              ;; Add any original field that is no longer here, with an empty value.
-              (mapcar #'list (seq-difference ekg-note-orig-fields
-                                             (mapcar #'car fields)))))))
-
-(defun ekg--update-from-metadata ()
-  "Update the `ekg-note' object from the metadata."
-  (cl-loop with values = (make-hash-table :test 'equal)
-           for (field . value) in (ekg--metadata-fields t)
-           do
-           (pcase (assoc-default field ekg-property-multivalue-type)
-             ('line (unless (string-empty-p value) (push value (gethash field values))))
-             ('comma (mapc (lambda (elt) (push elt (gethash field values)))
-                           (ekg--split-metadata-string value)))
-             (_ (setf (gethash field values) value)))
-           finally return
-           (maphash (lambda (key val)
-                      (if-let (func (assoc key ekg-metadata-parsers))
-                          (funcall (cdr func) (if (listp val)
-                                                  (nreverse (flatten-list val))
-                                                val))
-                        (warn "EKG: No function found for field %s" key)))
-                    values)))
-
 (defun ekg-capture-finalize ()
   "Save the current note."
   (interactive nil ekg-capture-mode)
-  (ekg--update-from-metadata)
   (ekg--save-note-in-buffer)
   (let ((note ekg-note))
     (kill-buffer)
@@ -1843,7 +1655,7 @@ executing a write if there is a problem."
   (ekg-connect)
   (let ((cleaned)
         (notes (triples-subjects-of-type ekg-db 'text)))
-    (cl-loop for type in ekg-schema-text-cotypes do
+    (cl-loop for type in (ekg-note-cotypes) do
              (cl-loop for s in (seq-difference (triples-subjects-of-type ekg-db type) notes) do
                       (push s cleaned)
                       (triples-remove-type ekg-db s type)))
@@ -2381,8 +2193,7 @@ found, insert, one by one, into the current note."
                             ;; sometimes possible when templates have more than
                             ;; one tag overlapping with the current note.
                             (unless (string-match (rx (literal (ekg-note-text template)))
-                                                  (buffer-substring-no-properties (+ 1 (overlay-end (ekg--metadata-overlay)))
-                                                                                  (point-max)))
+                                                  (buffer-substring-no-properties (point-min) (point-max)))
                               (unless (looking-at (rx (seq line-start line-end)))
                                 (insert "\n"))
                               (insert (ekg-note-text template)))))
@@ -2597,10 +2408,8 @@ as long as those notes aren't on resources that are interesting.
 
 (defun ekg-edit-note-display-text ()
   "From an edit or capture mode buffer, return display text.
-The display text is the text with all inlines executed, without
-any metadata text."
-  (let* ((text (buffer-substring (+ 1 (overlay-end (ekg--metadata-overlay)))
-                                 (point-max)))
+The display text is the text with all inlines executed."
+  (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
          (ticons (ekg-extract-inlines text)))
     (ekg-insert-inlines-results (car ticons) (cdr ticons) nil)))
 
