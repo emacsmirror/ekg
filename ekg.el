@@ -1431,7 +1431,7 @@ edit it as a comma separated list."
     (setq header-line-format (ekg--header-line-format))
     (message "Property %s updated" (car property))))
 
-(defun ekg-note-add-tag (tag)
+(defun ekg-note-add-tag (&optional tag)
   "Add TAG to the current note.
 TAG can be nil, and the user will be prompted for the tag."
   (interactive nil ekg-capture-mode ekg-edit-mode)
@@ -1449,7 +1449,7 @@ TAG can be nil, and the user will be prompted for the tag."
       (setq header-line-format (ekg--header-line-format))
       (message "Tag '%s' added" new-tag))))
 
-(defun ekg-note-remove-tag (tag)
+(defun ekg-note-remove-tag (&optional tag)
   "Remove TAG from the current note.
 
 TAG can be nil and the user will be prompted for the tag."
