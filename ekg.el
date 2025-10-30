@@ -1401,7 +1401,8 @@ edit it as a comma separated list."
                                        (ekg-note-available-properties ekg-note))))
          (property (assoc (completing-read "Property to edit: " property-alist nil t)
                           property-alist))
-         (property-single-valued (plist-get (triples-get-type ekg-db (cdr property) 'base) :unique))
+         (property-single-valued
+          (or (eq (cdr property) 'resource) (plist-get (triples-get-type ekg-db (cdr property) 'base) :unique)))
          (current-value (pcase (cdr property)
                           ('resource (format "%s" (ekg-note-id ekg-note)))
                           ('tagged/tag (ekg-note-tags ekg-note))
