@@ -1589,14 +1589,14 @@ Return the latest `ekg-note' object."
   "Save the edited note and refresh where it appears."
   (interactive nil ekg-edit-mode)
   (ekg-edit-save)
-  (kill-buffer))
+  (quit-window 'kill))
 
 (defun ekg-capture-finalize ()
   "Save the current note."
   (interactive nil ekg-capture-mode)
   (ekg--save-note-in-buffer)
   (let ((note ekg-note))
-    (kill-buffer)
+    (quit-window 'kill)
     (cl-loop for b being the buffers do
              (with-current-buffer b
                (when (and (eq major-mode 'ekg-notes-mode)
@@ -1619,7 +1619,7 @@ Notes saved as drafts will be deleted."
   (setq-local kill-buffer-query-functions
               (delq 'ekg--kill-buffer-query-function
                     kill-buffer-query-functions))
-  (kill-buffer))
+  (quit-window 'kill))
 
 (defun ekg-note-active-tags (note)
   "Return the tags of NOTE that are considered normal tags."
