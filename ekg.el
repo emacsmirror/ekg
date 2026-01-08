@@ -511,8 +511,10 @@ The notes returtned are sorted in reverse chronological order."
   (ekg-connect)
   (sort
    (seq-uniq (mapcan (lambda (tag) (ekg-get-notes-with-tag tag))
-                     (seq-difference tags (append (list ekg-function-tag)
-                                                  ekg-hidden-tags))))
+                     (seq-difference tags
+                                     (append (list ekg-function-tag)
+                                             ;; Don't include hidden tags unless specifically requested.
+                                             (seq-difference ekg-hidden-tags tags)))))
    #'ekg-sort-by-creation-time))
 
 (defun ekg-get-notes-with-tags (tags)

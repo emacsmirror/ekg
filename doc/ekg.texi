@@ -1824,7 +1824,7 @@ prefix argument allows you to edit the instructions sent to the agent.
 
 Internal agent notes (using the @samp{agent/self-info} and @samp{agent/status-instruct}
 tags) are hidden from normal view by being added to @samp{ekg-hidden-tags}. You can
-view these notes specifically with @samp{ekg-show-agent-notes}.
+view these notes specifically with @samp{ekg-agent-show-internal-notes}.
 
 You can also have the agent run automatically every day.  To do this, customize
 @code{ekg-agent-daily-time} to your preferred time (default is "09:00"), and then run:

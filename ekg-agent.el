@@ -401,7 +401,7 @@ Context (current note and last 10 notes with same tags):\n"
 (define-key ekg-capture-mode-map (kbd "C-c .") #'ekg-agent-note-response)
 (define-key ekg-edit-mode-map (kbd "C-c .") #'ekg-agent-note-response)
 
-(defun ekg-show-agent-notes ()
+(defun ekg-agent-show-internal-notes ()
   "Show notes with agent internal tags."
   (interactive)
   (ekg-show-notes-with-any-tags (list ekg-agent-self-info-tag ekg-agent-self-instruct-tag)))

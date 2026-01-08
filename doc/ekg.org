@@ -1292,7 +1292,7 @@ prefix argument allows you to edit the instructions sent to the agent.
 
 Internal agent notes (using the =agent/self-info= and =agent/status-instruct=
 tags) are hidden from normal view by being added to =ekg-hidden-tags=. You can
-view these notes specifically with =ekg-show-agent-notes=.
+view these notes specifically with =ekg-agent-show-internal-notes=.
 
 You can also have the agent run automatically every day.  To do this, customize
 ~ekg-agent-daily-time~ to your preferred time (default is "09:00"), and then run:
