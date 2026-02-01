@@ -543,6 +543,17 @@ Draft notes are not returned, unless TAGS contains the draft tag."
   "Get all notes with TAG, returning a list of `ekg-note' structs."
   (ekg-get-notes-with-tags (list tag)))
 
+(defun ekg-get-notes-with-parent-tag (tag)
+  "Get all notes with TAG or any of its subtags."
+  (ekg-connect)
+  (seq-uniq
+   (apply #'append
+          (ekg-get-notes-with-tag tag)
+          (mapcar #'ekg-get-notes-with-tag
+                  (ekg-tags-with-prefix (format "%s/" tag))))
+   (lambda (a b)
+     (equal (ekg-note-id a) (ekg-note-id b)))))
+
 (defun ekg-note-with-id-exists-p (id)
   "Return non-nil if a note with ID exists."
   (ekg-connect)
