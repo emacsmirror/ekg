@@ -23,85 +23,104 @@
 ;;; Commentary:
 ;; This module allows ekg to act as a source of tasks for org-mode.
 
+;;; Code:
+
 (require 'org-element)
 (require 'seq)
 (require 'ekg)
+(require 'llm)
 
-;; TODO: this may not be necessary if we have schema support for states, we can
-;; look up by the state which is a property.
-(defconst ekg-org-state-tag "org/state/"
+(defconst ekg-org-state-tag-prefix "org/state/"
   "Prefix for EKG tags representing Org TODO states.")
 
-;; TODO: this may not be necessary if we have schema support for tasks, we can
-;; just look up by type.
 (defconst ekg-org-task-tag "org/task"
   "Tag used to identify EKG notes that should be treated as Org tasks.")
 
 (defconst ekg-org-archive-tag "org/archive"
   "Tag used to identify EKG notes that should be treated as archived Org tasks.")
 
-;; TODO: once we have schema support we can look up by parent ID (or nil to get
-;; the top-level items)
+(defun ekg-org-add-schema ()
+  "Add schema for org-mode integration."
+  (triples-add-schema ekg-db 'org
+                      '(deadline :base/type integer :base/unique t)
+                      '(scheduled :base/type integer :base/unique t)
+                      '(parent-id :base/type integer :base/unique t))
+  ;; Mark 'org' as an ekg note type so it's managed with notes
+  (triples-set-type ekg-db 'org 'ekg-note-type))
+
+(add-hook 'ekg-add-schema-hook #'ekg-org-add-schema)
+
 (defun ekg-org-get-tasks (&optional archive)
-  "Fetch tasks from ekg and return as Org formatted string.
+  "Fetch top-level tasks from ekg, as ekg-note structs.
 
 If ARCHIVE is non-nil, fetch archived tasks instead. If nil, fetch
 active, unarchived, tasks."
-  ;; Replace this with actual DB fetching logic
   (seq-filter
    (lambda (note)
-     (and
-      (plist-get (ekg-note-properties note) :titled/title)
-      (not (and archive
-                (not (member ekg-org-archive-tag (ekg-note-tags note)))))))
+     (let ((props (ekg-note-properties note)))
+       (and
+        (plist-get props :titled/title)
+        ;; Only top-level tasks
+        (not (plist-get props :org/parent-id))
+        (let ((tags (ekg-note-tags note)))
+          (if archive
+              (member ekg-org-archive-tag tags)
+            (not (member ekg-org-archive-tag tags)))))))
    (ekg-get-notes-with-parent-tag ekg-org-task-tag)))
 
 (defun ekg-org-get-child-notes-of-id (id)
   "Fetch child notes of a given note ID."
+  (mapcar (lambda (row) (ekg-get-note-with-id (car row)))
+          (triples-db-select ekg-db nil 'org/parent-id id)))
 
-  ;; TODO: will need actual schema support for this.
-  nil
-  )
+(defun ekg-org--format-timestamp (timestamp)
+  "Parse TIMESTAMP integer into an Org timestamp string."
+  (format-time-string "<%Y-%m-%d %a %H:%M>" (seconds-to-time timestamp)))
+
+(defun ekg-org--to-timestamp (ts-string)
+  "Convert TS-STRING to a unix timestamp integer."
+  (time-convert (date-to-time ts-string) 'integer))
 
 (defun ekg-org-task-to-element (note parent)
   "Convert an EKG NOTE to an org-element node.
 
 PARENT is the parent org-element node."
-  (let* ((title (plist-get (ekg-note-properties note) :titled/title))
-         (id (number-to-string (ekg-note-id note)))
-         (state (upcase
-                 ;; Use the suffix of the first org/state/ tag found
-                 (string-replace ekg-org-state-tag ""
-                                 (car (seq-filter
-                                       (lambda (tag) (string-prefix-p ekg-org-state-tag tag))
-                                       (ekg-note-tags note)))))))
+  (let* ((props (ekg-note-properties note))
+         (title (plist-get props :titled/title))
+         (id (format "%s" (ekg-note-id note)))
+         (state (or (plist-get props :org/state)
+                    (let ((tag (car (seq-filter
+                                     (lambda (tag) (string-prefix-p ekg-org-state-tag-prefix tag))
+                                     (ekg-note-tags note)))))
+                      (when tag
+                        (upcase (string-replace ekg-org-state-tag-prefix "" tag))))))
+         (deadline (let ((d (plist-get props :org/deadline)))
+                     (when d (org-timestamp-from-time (time-convert d t)))))
+         (scheduled (let ((s (plist-get props :org/scheduled)))
+                      (when s (org-timestamp-from-time (time-convert s t))))))
     (let ((element (org-element-create
                     'headline
                     `(:level ,(+ 1 (or (org-element-property :level parent) 0))
-                             :parent ,parent
-                             :pre-blank 1
                              :title ,title
                              :tags ,(ekg-note-tags note)
-                             :todo-keyword ,state)
-                    (org-element-create
-                     'node-property
-                     `(:key "EKG_ID"
-                            :value ,id)))))
-      ;; Add contents of note
+                             :todo-keyword ,state
+                             ,@(when deadline `(:deadline ,deadline))
+                             ,@(when scheduled `(:scheduled ,scheduled))))))
       (org-element-set-contents
        element
-       ;; Let's add a link to the actual EKG entry if users want to navigate to it
-       (concat
-        (org-element-interpret-data
-         (org-element-create
-          'paragraph
-          `(:parent ,element
-                    :contents-begin 0
-                    :contents-end 0
-                    :post-blank 1)
-          (format "EKG Entry: [[ekg-note:%d][View in EKG]]"
-                  (ekg-note-id note))))
-        (ekg-display-note-text note)))
+       (append
+        (list
+         (org-element-create 'property-drawer nil
+                             (org-element-create 'node-property `(:key "EKG_ID" :value ,id)))
+         (org-element-create 'paragraph `(:post-blank 1)
+                             (format "EKG Entry: [[ekg-note:%s][View in EKG]]" id)))
+        (let ((text (ekg-display-note-text note)))
+          (when (and text (not (string-empty-p text)))
+            (with-temp-buffer
+              (insert text)
+              (org-element-contents (org-element-parse-buffer)))))
+        (mapcar (lambda (child-note) (ekg-org-task-to-element child-note element))
+                (ekg-org-get-child-notes-of-id (ekg-note-id note)))))
       element)))
 
 (defun ekg-org-task-to-string (note)
@@ -113,7 +132,6 @@ PARENT is the parent org-element node."
   "Generate Org formatted content from EKG tasks.
 
 If ARCHIVE is nil, use active tasks, if non-nil, use archived tasks."
-  ;; TODO: We just want the top-level tasks here
   (with-temp-buffer
     (let ((tasks (ekg-org-get-tasks archive)))
       (dolist (task tasks)
@@ -122,7 +140,10 @@ If ARCHIVE is nil, use active tasks, if non-nil, use archived tasks."
       (buffer-substring-no-properties (point-min) (point-max)))))
 
 (defun ekg-org-fs-handler (operation &rest args)
-  "Fake our ekg data as a file."
+  "Fake our ekg data as a file.
+
+OPERATION is the file operation being performed.
+ARGS are additional arguments to the operation."
   (let ((filename (car args)))
     (cond
      ;; 1. Emacs asks: "Does this file exist?" -> YES
@@ -174,4 +195,118 @@ If ARCHIVE is nil, use active tasks, if non-nil, use archived tasks."
 ;; But without this, we get an error.
 (add-to-list 'auto-mode-alist '("\\.org_archive" . org-mode))
 
+(defun ekg-org--agent-tool-add-item (title content tags parent-id status deadline scheduled)
+  "Add a new org task item to EKG.
+
+TITLE is the task title.
+CONTENT is the task content/description.
+TAGS is a list of additional tags.
+PARENT-ID is the parent task ID (nil for no parent)
+STATUS is the task status (will be converted to uppercase).
+DEADLINE is the deadline timestamp string (ignored if empty).
+SCHEDULED is the scheduled timestamp string (ignored if empty)."
+  (let* ((note (ekg-note-create :text content
+                                :tags (append (list ekg-org-task-tag) tags
+                                              (when (and status (not (string-empty-p status)))
+                                                (list (concat ekg-org-state-tag-prefix (downcase status)))))
+                                :properties (list :titled/title title))))
+    ;; Handle parent ID
+    (when (and parent-id (not (equal parent-id 0)) (not (string-empty-p (format "%s" parent-id))))
+      (setf (ekg-note-properties note) (plist-put (ekg-note-properties note) :org/parent-id parent-id)))
+    ;; Handle deadline
+    (when (and deadline (not (string-empty-p deadline)))
+      (setf (ekg-note-properties note) (plist-put (ekg-note-properties note) :org/deadline (ekg-org--to-timestamp deadline))))
+    ;; Handle scheduled
+    (when (and scheduled (not (string-empty-p scheduled)))
+      (setf (ekg-note-properties note) (plist-put (ekg-note-properties note) :org/scheduled (ekg-org--to-timestamp scheduled))))
+    ;; Save the note
+    (ekg-save-note note)
+    (ekg-note-id note)))
+
+(defun ekg-org--agent-tool-set-status (id status)
+  "Set the status of an org task item.
+
+ID is the note ID.
+STATUS is the new status (will be converted to uppercase)."
+  (let ((note (ekg-get-note-with-id id)))
+    (unless note
+      (error "No note found with ID %s" id))
+    (setf (ekg-note-tags note)
+          (cons
+           (concat ekg-org-state-tag-prefix (downcase status))
+           (seq-remove
+            (lambda (tag) (string-prefix-p ekg-org-state-tag-prefix tag))
+            (ekg-note-tags note))))
+    (ekg-save-note note)))
+
+(defun ekg-org--agent-tool-list-items (&optional state include-archived)
+  "List all org task items.
+
+STATE if non-nil, filter by status (e.g., \"TODO\", \"DONE\").
+INCLUDE-ARCHIVED if non-nil, include archived tasks.
+Returns a list of items with ID, Title, Status, and Parent ID."
+  (let ((notes (append
+                (ekg-org-get-tasks nil)
+                (when include-archived
+                  (ekg-org-get-tasks t))))
+        (result '()))
+    (dolist (note notes)
+      (let* ((props (ekg-note-properties note))
+             (tags (ekg-note-tags note))
+             (title (plist-get props :titled/title))
+             (item-status (let ((tag (car (seq-filter
+                                           (lambda (tag) (string-prefix-p ekg-org-state-tag-prefix tag))
+                                           tags))))
+                            (when tag
+                              (upcase (string-replace ekg-org-state-tag-prefix "" tag)))))
+             (parent-id (plist-get props :org/parent-id)))
+        (when (or (not state) (string-equal (upcase state) (or item-status "")))
+          (push (list :id (ekg-note-id note)
+                      :title title
+                      :status item-status
+                      :parent-id parent-id)
+                result))))
+    (nreverse result)))
+
+(defconst ekg-org-tool-add-task
+  (llm-make-tool
+   :function #'ekg-org--agent-tool-add-item
+   :name "add_org_item"
+   :description "Add a new org-mode task item"
+   :args
+   '((:name "title" :type string :description "The title/headline of the task" :require t)
+     (:name "content" :type string :description "The content/description of the task" :required t)
+     (:name "tags" :type array :items (:type string)
+            :description "Additional tags for the task (org tags and agent tags will be added automatically)")
+     (:name "parent_id" :type integer :description "The parent task ID if exists")
+     (:name "status" :type string :description "The task status (TODO, DONE, etc.), will default to TODO if not set")
+     (:name "deadline" :type string :description "The deadline timestamp in ISO 8601 format")
+     (:name "scheduled" :type string :description "The scheduled timestamp in ISO 8601 format"))))
+
+(defconst ekg-org-tool-set-status
+  (llm-make-tool
+   :function #'ekg-org--agent-tool-set-status
+   :name "set_org_item_status"
+   :description "Set the status of an org-mode task item"
+   :args
+   '((:name "id" :type integer :description "The ID of the task item" :required t)
+     (:name "status" :type string :description "The new status of the task (TODO, DONE, etc.)" :required t))))
+
+(defconst ekg-org-tool-list-items
+  (llm-make-tool
+   :function #'ekg-org--agent-tool-list-items
+   :name "list_org_items"
+   :description "List all org-mode task items"
+   :args
+   '((:name "state" :type string
+            :description "Filter tasks by state (TODO, DONE, etc.)")
+     (:name "include_archived" :type boolean
+            :description "Whether to include archived tasks"))))
+
+(with-eval-after-load 'ekg-agent
+  (add-to-list 'ekg-agent-extra-tools ekg-org-tool-add-task)
+  (add-to-list 'ekg-agent-extra-tools ekg-org-tool-set-status)
+  (add-to-list 'ekg-agent-extra-tools ekg-org-tool-list-items))
+
 (provide 'ekg-org)
+;;; ekg-org.el ends here
