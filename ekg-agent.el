@@ -128,6 +128,52 @@ Changes to this variable will take effect the next time you call
                  :description "List all existing tags in the ekg database."
                  :args '()))
 
+(defun ekg-agent--get-note-with-id (id)
+  "Retrieve the note with string ID, handling different ID types.
+
+This tries a few different things, since ekg ids can of various types,
+but we'll only get strings from the LLM."
+  (or (ekg-get-note-with-id id)
+      (let ((int-id (string-to-number id)))
+        (when (> int-id 0)
+          (ekg-get-note-with-id int-id)))
+      (ekg-get-note-with-id (intern id))))
+
+(defconst ekg-agent-tool-append-to-note
+  (make-llm-tool :function (lambda (id content)
+                             (let ((note (ekg-agent--get-note-with-id id)))
+                               (unless note
+                                 (error "Note with ID %s not found" id))
+                               (let* ((enclosure (assoc-default (ekg-note-mode note) ekg-llm-format-output nil '("_BEGIN_" . "_END_")))
+                                      (new-text (concat (ekg-note-text note) "\n"
+                                                        (car enclosure) "\n"
+                                                        content "\n"
+                                                        (cdr enclosure))))
+                                 (setf (ekg-note-text note) new-text)
+                                 (ekg-save-note note)
+                                 (format "Appended content to note ID %s" id))))
+                 :name "append_to_note"
+                 :description "Append content to an existing note by its ID."
+                 :args '((:name "id" :type string :description "The unique identifier of the note.")
+                         (:name "content" :type string :description "The content to append to the note."))))
+
+(defconst ekg-agent-tool-replace-note
+  (make-llm-tool :function (lambda (id content)
+                             (let ((note (ekg-agent--get-note-with-id id)))
+                               (unless note
+                                 (error "Note with ID %s not found" id))
+                               (let* ((enclosure (assoc-default (ekg-note-mode note) ekg-llm-format-output nil '("_BEGIN_" . "_END_")))
+                                      (new-text (concat (car enclosure) "\n"
+                                                        content "\n"
+                                                        (cdr enclosure))))
+                                 (setf (ekg-note-text note) new-text)
+                                 (ekg-save-note note)
+                                 (format "Replaced content of note ID %s" id))))
+                 :name "replace_note"
+                 :description "Replace the content of an existing note by its ID."
+                 :args '((:name "id" :type string :description "The unique identifier of the note.")
+                         (:name "content" :type string :description "The new content for the note."))))
+
 (defconst ekg-agent-tool-create-note
   (make-llm-tool :function (lambda (tags content mode)
                              (unless (member mode '("org-mode" "markdown-mode" "text-mode"))
@@ -177,6 +223,8 @@ Changes to this variable will take effect the next time you call
    ekg-agent-tool-get-note-by-id
    ekg-agent-tool-search-notes
    ekg-agent-tool-list-tags
+   ekg-agent-tool-append-to-note
+   ekg-agent-tool-replace-note
    ekg-agent-tool-create-note
    ekg-agent-tool-ask-user
    ekg-agent-tool-end)
@@ -301,6 +349,9 @@ self (which you may want to use when you see how the user is interacting
 with your text), so that you can behave more usefully in the future.
 Write notes with these tags if you feel you have discovered something
 that will make future runs better, and want to record this.
+
+When executing a long-running task, one that is taking more than 5
+iterations, start saving your state every few iterations to a note.
 
 When creating a note, text that you add will automatically have the tags
 surrounding it to indicate that it was written by an LLM.  Do not add
