@@ -40,6 +40,10 @@
 (defconst ekg-org-archive-tag "org/archive"
   "Tag used to identify EKG notes that should be treated as archived Org tasks.")
 
+(defun ekg-org--note-title (note)
+  "Return the title string of NOTE, or nil if it has no title."
+  (car (plist-get (ekg-note-properties note) :titled/title)))
+
 (defun ekg-org-add-schema ()
   "Add schema for integration with `org-mode'."
   (triples-add-schema ekg-db 'org
@@ -75,8 +79,9 @@ active, unarchived, tasks."
 
 (defun ekg-org-get-child-notes-of-id (id)
   "Fetch child notes of a given note ID."
-  (mapcar (lambda (row) (ekg-get-note-with-id (car row)))
-          (triples-db-select ekg-db nil 'org/parent-id id)))
+  (seq-filter #'ekg-note-active-p
+              (mapcar (lambda (row) (ekg-get-note-with-id (car row)))
+                      (triples-db-select ekg-db nil 'org/parent id))))
 
 (defun ekg-org--format-timestamp (timestamp)
   "Parse TIMESTAMP integer into an Org timestamp string."
@@ -102,7 +107,11 @@ PARENT is the parent org-element node."
                     'headline
                     `(:level ,(+ 1 (or (org-element-property :level parent) 0))
                              :title ,title
-                             :tags ,(ekg-note-tags note)
+                             :tags ,(seq-filter
+                                     (lambda (tag) (and (not (string-prefix-p ekg-org-state-tag-prefix tag))
+                                                        (not (string-equal tag ekg-org-task-tag))
+                                                        (not (string-equal tag ekg-org-archive-tag))))
+                                     (ekg-note-tags note))
                              :todo-keyword ,state
                              ,@(when deadline `(:deadline ,deadline))
                              ,@(when scheduled `(:scheduled ,scheduled))))))
@@ -156,15 +165,18 @@ an ekg-note and returns nil to exclude it."
 
 NEW-STATE is one of the standard org states."
   (interactive (list (completing-read "New state: " org-todo-keywords-1)))
-  (unless (and (member 'ekg-edit-mode local-minor-modes)
-               (ekg-org--org-note-p ekg-note))
-    (error "Not in an EKG org task buffer"))
-  (setf (ekg-note-tags ekg-note)
-        (cons
-         (concat ekg-org-state-tag-prefix (downcase new-state))
-         (seq-remove
-          (lambda (tag) (string-prefix-p ekg-org-state-tag-prefix tag))
-          (ekg-note-tags ekg-note)))))
+  (let ((ekg-note (ekg-current-note-or-error-expanded)))
+    (setf (ekg-note-tags ekg-note)
+          (cons
+           (concat ekg-org-state-tag-prefix (downcase new-state))
+           (seq-remove
+            (lambda (tag) (string-prefix-p ekg-org-state-tag-prefix tag))
+            (ekg-note-tags ekg-note))))
+    ;; We save unless we're currently editing the note.
+    (unless (member 'ekg-edit-mode local-minor-modes)
+      (ekg-save-note ekg-note)
+      (when (member 'ekg-notes-mode local-minor-modes)
+        (ekg-notes-refresh)))))
 
 (defun ekg-org-capture (title)
   "Capture a new org task with TITLE into EKG."
@@ -174,6 +186,116 @@ NEW-STATE is one of the standard org states."
                             :titled/title (list title))
                :tags (list ekg-org-task-tag
                            (format "%s%s" ekg-org-state-tag-prefix "todo"))))
+
+(defun ekg-org--get-hierarchy (note &optional max-depth)
+  "Return the org hierarchy for NOTE as a list, from root to NOTE.
+Walk up the parent chain, collecting notes.  MAX-DEPTH limits the
+traversal depth to avoid infinite loops; defaults to 10."
+  (let ((hierarchy (list note))
+        (depth (or max-depth 10))
+        (current note))
+    (while (and (> depth 0)
+                (let ((parent-id (plist-get (ekg-note-properties current) :org/parent)))
+                  (when parent-id
+                    (let ((parent (ekg-get-note-with-id parent-id)))
+                      (when parent
+                        (push parent hierarchy)
+                        (setq current parent)
+                        t)))))
+      (cl-decf depth))
+    hierarchy))
+
+(defun ekg-org--hierarchy-to-text (hierarchy)
+  "Format HIERARCHY (a list of notes from root to leaf) as context text.
+Each level is indented to show the nesting structure."
+  (let ((depth 0))
+    (mapconcat
+     (lambda (note)
+       (let* ((title (or (ekg-org--note-title note) "(untitled)"))
+              (state (condition-case nil (ekg-org--state note) (error "UNKNOWN")))
+              (text (string-trim (or (ekg-note-text note) "")))
+              (indent (make-string (* 2 depth) ?\s))
+              (result (concat
+                       (format "%s[%s] %s (id: %s)\n" indent state title (ekg-note-id note))
+                       (when (and text (not (string-empty-p text)))
+                         (format "%s  %s\n" indent
+                                 (replace-regexp-in-string
+                                  "\n" (concat "\n" indent "  ") text))))))
+         (cl-incf depth)
+         result))
+     hierarchy "")))
+
+(defun ekg-org-agent-plan-task ()
+  "Plan the current task and add the plan as child tasks using the agent."
+  (let* ((ekg-note (ekg-current-note-or-error-expanded))
+         (parent-id (ekg-note-id ekg-note))
+         (parent-note (ekg-get-note-with-id parent-id))
+         (question (format "Given the task '%s', create a plan to accomplish it by creating subtasks using the tool to add ekg org tasks or add information to existing ekg note tasks. The parent ekg note id is '%s'."
+                           (ekg-org--note-title parent-note)
+                           parent-id)))
+    (ekg-agent-ask-with-note question parent-id (list ekg-org-tool-add-task))))
+
+(defun ekg-org-agent-run-task ()
+  "Execute the current org task autonomously using the agent.
+The agent receives the full org hierarchy as context (current task,
+parent, grandparent, etc.) and instructions to complete the task.
+When finished, the agent sets the task status (typically DONE),
+which ends the agent session.  No human input is required."
+  (interactive)
+  (let* ((ekg-note (ekg-current-note-or-error-expanded))
+         (task-id (ekg-note-id ekg-note))
+         (note (ekg-get-note-with-id task-id))
+         (hierarchy (ekg-org--get-hierarchy note))
+         (hierarchy-text (ekg-org--hierarchy-to-text hierarchy))
+         (title (or (ekg-org--note-title note) "(untitled)"))
+         (children (ekg-org-get-child-notes-of-id task-id))
+         (children-text (when children
+                          (concat "\n\nChild tasks:\n"
+                                  (mapconcat
+                                   (lambda (child)
+                                     (format "  - [%s] %s (id: %s)"
+                                             (condition-case nil (ekg-org--state child) (error "UNKNOWN"))
+                                             (or (ekg-org--note-title child) "(untitled)")
+                                             (ekg-note-id child)))
+                                   children "\n"))))
+         (prompt-notes (ekg-get-notes-cotagged-with-tags
+                        (ekg-note-tags note) ekg-llm-prompt-tag))
+         (prompt-context (when prompt-notes
+                           (concat "\n\nPrompt instructions from co-tagged notes:\n"
+                                   (mapconcat (lambda (n)
+                                                (string-trim
+                                                 (substring-no-properties
+                                                  (ekg-display-note-text n nil 'plaintext))))
+                                              prompt-notes "\n"))))
+         (context (concat
+                   "You are executing an org task autonomously. Here is the full task hierarchy, "
+                   "from the root task down to the current task you must execute:\n\n"
+                   hierarchy-text
+                   (or children-text "")
+                   (or prompt-context "")
+                   "\n\n"
+                   (format "The current date and time is %s." (format-time-string "%F %R"))))
+         (question (concat
+                    (format "Execute the following task: '%s' (note id: %s).\n\n" title task-id)
+                    "Complete this task using the tools available to you. "
+                    "You should NOT ask the user for input. Work autonomously.\n\n"
+                    "When you are done, you MUST call the `set_org_item_status` tool to "
+                    "set this task's status (typically to DONE, or WAITING if blocked). "
+                    "Calling `set_org_item_status` will end your session.\n\n"
+                    "Before setting the status, use `display_result_in_popup` to tell the user what you did.")))
+    (ekg-agent--iterate (llm-make-chat-prompt
+                         question
+                         :context (concat (ekg-agent-instructions-intro) "\n\n" context)
+                         :tools (ekg-agent--tools
+                                 (list ekg-agent-tool-popup-result
+                                       ekg-org-tool-add-task
+                                       ekg-org-tool-set-status
+                                       ekg-org-tool-list-items))
+                         :tool-options (make-llm-tool-options :tool-choice 'any))
+                        0
+                        (ekg-agent--make-status-callback)
+                        '("set_org_item_status")
+                        (ekg-agent--timeout-deadline))))
 
 (defun ekg-org-fs-handler (operation &rest args)
   "Fake our ekg data as a file.
@@ -238,6 +360,21 @@ ARGS are additional arguments to the operation."
           (apply operation args))))))
 
 (add-to-list 'file-name-handler-alist '("\\`/ekg:" . ekg-org-fs-handler))
+
+(defun ekg-org-revert-buffers (note)
+  "Revert any buffers visiting the fake ekg org files.
+Optionally check NOTE to only revert when org tasks change."
+  (when (or (null note) (ekg-org--org-note-p note))
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and buffer-file-name
+                   (string-match "\\`/ekg:" buffer-file-name)
+                   (buffer-modified-p buf))
+          (revert-buffer t t t))))))
+
+;; When we save an org note, any org buffers showing our fake files should
+;; update to reflect the changes.
+(add-hook 'ekg-note-save-hook #'ekg-org-revert-buffers)
 
 ;; Add the fake file to Org Agenda
 (add-to-list 'org-agenda-files "/ekg:tasks.org")
