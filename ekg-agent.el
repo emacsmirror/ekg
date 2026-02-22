@@ -117,6 +117,16 @@ stdout will be returned."
 (defvar-local ekg-agent--cancelled-p nil
   "Non-nil when the user has requested cancellation of the agent.")
 
+(defvar-local ekg-agent--current-request nil
+  "The in-flight LLM request handle, for cancellation.")
+
+(defvar-local ekg-agent--tool-processes nil
+  "List of active tool subprocesses, for force cancellation.")
+
+(defvar-local ekg-agent--status-callback nil
+  "The status callback for the current agent run.
+Stored so that `ekg-agent-force-cancel' can invoke it.")
+
 (defvar ekg-agent--daily-timer nil
   "Timer object for the daily agent evaluation.")
 
@@ -328,43 +338,55 @@ but we'll only get strings from the LLM."
                  :description "Display the result of a query in a popup buffer.  Use markdown mode for formatting."
                  :args '((:name "result" :type string :description "The result to display."))))
 
-(defun ekg-agent--run-code (prompt)
-  "Run the configured `ekg-agent-code-command` with PROMPT on stdin."
-  (ekg-agent--with-error-as-text
-    (unless (and (stringp ekg-agent-code-command)
-                 (string-match-p "\\S-" ekg-agent-code-command))
-      (error "Ekg-agent-code-command is not configured"))
-    (let* ((args (split-string-and-unquote ekg-agent-code-command))
-           (program (car args))
-           (program-args (cdr args)))
-      (with-temp-buffer
-        (insert prompt)
-        (let ((exit-code (apply #'call-process-region
-                                (point-min) (point-max)
-                                program
-                                t
-                                (list t t)
-                                nil
-                                program-args)))
-          (if (and (integerp exit-code) (zerop exit-code))
-              (string-trim-right (buffer-string))
-            (error "Command failed (%s): %s"
-                   exit-code
-                   (string-trim-right (buffer-string)))))))))
+(defun ekg-agent--run-code (callback prompt)
+  "Run the configured `ekg-agent-code-command` asynchronously with PROMPT on stdin.
+CALLBACK is called with the result string when the process finishes."
+  (condition-case err
+      (progn
+        (unless (and (stringp ekg-agent-code-command)
+                     (string-match-p "\\S-" ekg-agent-code-command))
+          (error "Ekg-agent-code-command is not configured"))
+        (let* ((args (split-string-and-unquote ekg-agent-code-command))
+               (program (car args))
+               (program-args (cdr args))
+               (output-buf (generate-new-buffer " *ekg-agent-code*" t))
+               (proc (make-process
+                      :name "ekg-agent-code"
+                      :buffer output-buf
+                      :command (cons program program-args)
+                      :sentinel (lambda (process _event)
+                                  (when (memq (process-status process) '(exit signal))
+                                    (let* ((exit-code (process-exit-status process))
+                                           (output (with-current-buffer (process-buffer process)
+                                                     (buffer-string))))
+                                      (kill-buffer (process-buffer process))
+                                      (funcall callback
+                                               (if (zerop exit-code)
+                                                   (string-trim-right output)
+                                                 (format "Error: Command failed (%d): %s"
+                                                         exit-code
+                                                         (string-trim-right output))))))))))
+          (process-send-string proc prompt)
+          (process-send-eof proc)
+          (push proc ekg-agent--tool-processes)))
+    (error (funcall callback (format "Error: %s" (error-message-string err))))))
 
 (defconst ekg-agent-tool-run-elisp
   (make-llm-tool :function (lambda (callback elisp return)
-                             (async-start (lambda ()
-                                            (let* (e
-                                                   (result
-                                                    (condition-case err
-                                                        (eval (read elisp))
-                                                      (error (setq e (format "%S" err))))))
-                                              (or e
-                                                  (if (equal return "result")
-                                                      (format "%S" result)
-                                                    (buffer-substring-no-properties (point-min) (point-max))))))
-                                          callback))
+                             (let ((proc
+                                    (async-start (lambda ()
+                                                   (let* (e
+                                                          (result
+                                                           (condition-case err
+                                                               (eval (read elisp))
+                                                             (error (setq e (format "%S" err))))))
+                                                     (or e
+                                                         (if (equal return "result")
+                                                             (format "%S" result)
+                                                           (buffer-substring-no-properties (point-min) (point-max))))))
+                                                 callback)))
+                               (when (processp proc)
+                                 (push proc ekg-agent--tool-processes))))
                  :name "run_elisp"
                  :description "Evaluate arbitrary Emacs Lisp and return the printed result of the final form."
                  :args '((:name "elisp" :type string :description "The Emacs Lisp code to evaluate." :required t)
@@ -377,7 +399,8 @@ but we'll only get strings from the LLM."
   (make-llm-tool :function #'ekg-agent--run-code
                  :name "run_code_tool"
                  :description "Run the configured coding tool (such as 'claude code') command with the prompt and return the result.  If you want to accomplish a significant task that may not be possible with the tools you have access, ask this tool, which has more functionality."
-                 :args '((:name "prompt" :type string :description "The prompt to pass to the tool."))))
+                 :args '((:name "prompt" :type string :description "The prompt to pass to the tool."))
+                 :async t))
 
 (defun ekg-agent--tools (extra-tools)
   "Return the list of tools available to the agent.
@@ -479,6 +502,24 @@ EXTRA-TOOLS is a list of additional tools beyond
   (when (and (numberp ekg-agent-timeout-seconds)
              (> ekg-agent-timeout-seconds 0))
     (+ (float-time) ekg-agent-timeout-seconds)))
+
+(defun ekg-agent--clean-orphaned-tool-interactions (prompt)
+  "Remove a trailing assistant tool-use interaction from PROMPT.
+When cancelling mid-tool-execution, the prompt may end with an
+assistant interaction containing structured tool-use data but no
+matching `tool-results' interaction.  LLM providers will reject
+this, so remove it.  A tool-use interaction is detected by having
+non-string content in the assistant role."
+  (let ((interactions (llm-chat-prompt-interactions prompt)))
+    (when interactions
+      (let ((last-interaction (car (last interactions))))
+        (when (and (eq (llm-chat-prompt-interaction-role last-interaction)
+                       'assistant)
+                   (not (stringp
+                         (llm-chat-prompt-interaction-content
+                          last-interaction))))
+          (setf (llm-chat-prompt-interactions prompt)
+                (butlast interactions)))))))
 
 (defun ekg-agent--prompt-append-user-message (prompt message)
   "Append a user MESSAGE to PROMPT."
@@ -700,20 +741,29 @@ identifiers."
            (:name "end_text" :type string :description "The text on the end line that marks the end of the region to replace (inclusive)." :required t)
            (:name "replacement" :type string :description "The new text to insert in place of the matched region." :required t))))
 
-(defun ekg-agent--run-command (command &optional directory)
-  "Run shell COMMAND and return its combined stdout and stderr.
-DIRECTORY, if given, is used as `default-directory' for the
-process.  Returns a string with the exit code and output."
-  (ekg-agent--with-error-as-text
-    (let* ((default-directory (if directory
-                                  (file-truename directory)
-                                default-directory))
-           (output (with-temp-buffer
-                     (let ((exit-code (call-process
-                                       shell-file-name nil t nil
-                                       shell-command-switch command)))
-                       (format "Exit code: %d\n%s" exit-code (buffer-string))))))
-      (substring-no-properties output))))
+(defun ekg-agent--run-command (callback command &optional directory)
+  "Run shell COMMAND asynchronously and call CALLBACK with the result.
+DIRECTORY, if given, is used as `default-directory' for the process."
+  (condition-case err
+      (let* ((default-directory (if directory
+                                    (file-truename directory)
+                                  default-directory))
+             (output-buf (generate-new-buffer " *ekg-agent-cmd*" t))
+             (proc (make-process
+                    :name "ekg-agent-command"
+                    :buffer output-buf
+                    :command (list shell-file-name shell-command-switch command)
+                    :sentinel (lambda (process _event)
+                                (when (memq (process-status process) '(exit signal))
+                                  (let ((result
+                                         (with-current-buffer (process-buffer process)
+                                           (format "Exit code: %d\n%s"
+                                                   (process-exit-status process)
+                                                   (buffer-string)))))
+                                    (kill-buffer (process-buffer process))
+                                    (funcall callback (substring-no-properties result))))))))
+        (push proc ekg-agent--tool-processes))
+    (error (funcall callback (format "Error: %s" (error-message-string err))))))
 
 (defconst ekg-agent-tool-run-command
   (make-llm-tool
@@ -721,7 +771,8 @@ process.  Returns a string with the exit code and output."
    :name "run_command"
    :description "Run a shell command and return its combined stdout/stderr and exit code."
    :args '((:name "command" :type string :description "The shell command to run." :required t)
-           (:name "directory" :type string :description "Working directory for the command.  Defaults to the current buffer's directory."))))
+           (:name "directory" :type string :description "Working directory for the command.  Defaults to the current buffer's directory."))
+   :async t))
 
 (defconst ekg-agent-base-tools
   (list
@@ -1097,6 +1148,7 @@ to create new notes or perform other actions to help the user."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'ekg-agent-continue)
     (define-key map (kbd "C-c C-k") #'ekg-agent-cancel)
+    (define-key map (kbd "C-c C-q") #'ekg-agent-force-cancel)
     map)
   "Keymap for `ekg-agent-log-mode'.")
 
@@ -1109,10 +1161,15 @@ Provides commands to continue or cancel agent work.
   :keymap ekg-agent-log-mode-map)
 
 (defun ekg-agent--set-stopped (log-buf)
-  "Mark the agent as no longer running in LOG-BUF."
+  "Mark the agent as no longer running in LOG-BUF.
+Return non-nil if the agent was actually running and is now stopped.
+This acts as a once-only guard to ensure status callbacks fire exactly once."
   (when (and log-buf (buffer-live-p log-buf))
     (with-current-buffer log-buf
-      (setq ekg-agent--running-p nil))))
+      (when ekg-agent--running-p
+        (setq ekg-agent--running-p nil)
+        (setq ekg-agent--current-request nil)
+        t))))
 
 (defun ekg-agent--iterate (prompt iteration-num &optional status-callback end-tools deadline timeout-final)
   "Run an iteration of the ekg agent with PROMPT and ITERATION-NUM.
@@ -1156,6 +1213,9 @@ session.  At iteration 0 the log buffer is created and
           (setq ekg-agent--end-tools end-tools)
           (setq ekg-agent--running-p t)
           (setq ekg-agent--cancelled-p nil)
+          (setq ekg-agent--current-request nil)
+          (setq ekg-agent--tool-processes nil)
+          (setq ekg-agent--status-callback status-callback)
           (ekg-agent-log-mode 1)
           (goto-char (point-min))
           (ekg-agent--iterate prompt 1
@@ -1170,66 +1230,69 @@ session.  At iteration 0 the log buffer is created and
         (ekg-agent--log "Timeout reached; requesting final state note.")
         (ekg-agent--prompt-append-user-message prompt (ekg-agent--timeout-warning-message))
         (setq timeout-final t))
-      (llm-chat-async
-       (ekg-agent--provider)
-       prompt
-       (lambda (result)
-         (if (and (buffer-live-p log-buf)
-                  (buffer-local-value 'ekg-agent--cancelled-p log-buf))
-             ;; Cancelled by user
-             (progn
-               (ekg-agent--set-stopped log-buf)
-               (with-current-buffer log-buf
-                 (ekg-agent--log "Agent stopped (cancelled by user)"))
-               (when status-callback (funcall status-callback "stopped by user")))
-           ;; Normal processing of result
-           (let ((result-alist (plist-get result :tool-results))
-                 (end-tools (or end-tools '("end"))))
-             (if result-alist
-                 (let ((tools-ran (mapconcat (lambda (result)
-                                               (format "Tool: %s Result: %s"
-                                                       (car result) (cdr result)))
-                                             result-alist ", ")))
-                   (if (and log-buf (buffer-live-p log-buf))
+      (let ((request
+              (llm-chat-async
+               (ekg-agent--provider)
+               prompt
+               (lambda (result)
+                 (if (and (buffer-live-p log-buf)
+                          (buffer-local-value 'ekg-agent--cancelled-p log-buf))
+                     ;; Cancelled by user
+                     (when (ekg-agent--set-stopped log-buf)
                        (with-current-buffer log-buf
-                         (ekg-agent--log "Tools: %s" tools-ran))
-                     (message "Ran tools: %s" tools-ran)))
-               ;; Everything must be a tool call, by default if it just gets
-               ;; non-tool output we'll log it, and then instruct it to use
-               ;; tools to end if needed.
-               (when (and log-buf (buffer-live-p log-buf))
-                 (with-current-buffer log-buf
-                   (ekg-agent--log (plist-get :text result))))
-               (llm-chat-prompt-append-response
-                prompt
-                (format "That has been communicated to the user.  Please always call tools.  This session cannot end until you call one of the following tools: %s."
-                        (string-join end-tools ", "))))
+                         (ekg-agent--log "Agent stopped (cancelled by user)"))
+                       (when status-callback (funcall status-callback "stopped by user")))
+                   ;; Normal processing of result
+                   (let ((result-alist (plist-get result :tool-results))
+                         (end-tools (or end-tools '("end"))))
+                     (if result-alist
+                         (let ((tools-ran (mapconcat (lambda (result)
+                                                       (format "Tool: %s Result: %s"
+                                                               (car result) (cdr result)))
+                                                     result-alist ", ")))
+                           (if (and log-buf (buffer-live-p log-buf))
+                               (with-current-buffer log-buf
+                                 (ekg-agent--log "Tools: %s" tools-ran))
+                             (message "Ran tools: %s" tools-ran)))
+                       ;; Everything must be a tool call, by default if it just gets
+                       ;; non-tool output we'll log it, and then instruct it to use
+                       ;; tools to end if needed.
+                       (when (and log-buf (buffer-live-p log-buf))
+                         (with-current-buffer log-buf
+                           (ekg-agent--log (plist-get :text result))))
+                       (llm-chat-prompt-append-response
+                        prompt
+                        (format "That has been communicated to the user.  Please always call tools.  This session cannot end until you call one of the following tools: %s."
+                                (string-join end-tools ", "))))
 
-             (cond
-              (timeout-final
-               (ekg-agent--set-stopped log-buf)
-               (when status-callback (funcall status-callback "stopped by timeout")))
-              ((seq-find (lambda (end-tool) (assoc-default end-tool result-alist)) end-tools)
-               (ekg-agent--set-stopped log-buf)
-               (when status-callback
-                 (funcall
-                  status-callback
-                  (mapconcat (lambda (end-tool)
-                               (assoc-default end-tool result-alist))
-                             (seq-filter (lambda (end-tool) (assoc-default end-tool result-alist))
-                                         end-tools)
-                             ", "))))
-              (t
-               (ekg-agent--iterate prompt
-                                   (+ 1 iteration-num)
-                                   status-callback
-                                   end-tools
-                                   deadline))))))
-       (lambda (_ err)
-         (ekg-agent--set-stopped log-buf)
-         (when status-callback (funcall status-callback 'error))
-         (error "%s" err))
-       t))))
+                     (cond
+                      (timeout-final
+                       (when (ekg-agent--set-stopped log-buf)
+                         (when status-callback (funcall status-callback "stopped by timeout"))))
+                      ((seq-find (lambda (end-tool) (assoc-default end-tool result-alist)) end-tools)
+                       (when (ekg-agent--set-stopped log-buf)
+                         (when status-callback
+                           (funcall
+                            status-callback
+                            (mapconcat (lambda (end-tool)
+                                         (assoc-default end-tool result-alist))
+                                       (seq-filter (lambda (end-tool) (assoc-default end-tool result-alist))
+                                                   end-tools)
+                                       ", ")))))
+                      (t
+                       (ekg-agent--iterate prompt
+                                           (+ 1 iteration-num)
+                                           status-callback
+                                           end-tools
+                                           deadline))))))
+               (lambda (_ err)
+                 (when (ekg-agent--set-stopped log-buf)
+                   (when status-callback (funcall status-callback 'error))
+                   (error "%s" err)))
+               t)))
+        (when (buffer-live-p log-buf)
+          (with-current-buffer log-buf
+            (setq ekg-agent--current-request request)))))))
 
 (defun ekg-agent-continue (message)
   "Continue the agent from where it left off.
@@ -1241,15 +1304,20 @@ Prompts for a MESSAGE with additional instructions for the agent."
     (user-error "Agent is already running"))
   (setq ekg-agent--cancelled-p nil)
   (setq ekg-agent--running-p t)
-  (ekg-agent--log-session-start "Continuing agent")
-  (when (and message (not (string-empty-p message)))
-    (ekg-agent--prompt-append-user-message ekg-agent--prompt message)
-    (ekg-agent--log "User message: %s" message))
-  (ekg-agent--iterate ekg-agent--prompt
-                      1
-                      (ekg-agent--make-status-callback)
-                      ekg-agent--end-tools
-                      (ekg-agent--timeout-deadline)))
+  (setq ekg-agent--current-request nil)
+  (setq ekg-agent--tool-processes nil)
+  (ekg-agent--clean-orphaned-tool-interactions ekg-agent--prompt)
+  (let ((cb (ekg-agent--make-status-callback)))
+    (setq ekg-agent--status-callback cb)
+    (ekg-agent--log-session-start "Continuing agent")
+    (when (and message (not (string-empty-p message)))
+      (ekg-agent--prompt-append-user-message ekg-agent--prompt message)
+      (ekg-agent--log "User message: %s" message))
+    (ekg-agent--iterate ekg-agent--prompt
+                        1
+                        cb
+                        ekg-agent--end-tools
+                        (ekg-agent--timeout-deadline))))
 
 (defun ekg-agent-cancel ()
   "Cancel the current agent run, preserving the prompt for continuation.
@@ -1260,6 +1328,33 @@ Use \\[ekg-agent-continue] to resume."
     (user-error "No agent is currently running"))
   (setq ekg-agent--cancelled-p t)
   (ekg-agent--log "Cancellation requested; will stop after current tool call"))
+
+(defun ekg-agent-force-cancel ()
+  "Force-cancel the current agent run by killing in-flight requests.
+Unlike `ekg-agent-cancel', which waits for the current operation to
+finish, this immediately kills the LLM request and any tool
+subprocesses.  Use \\[ekg-agent-continue] to resume."
+  (interactive)
+  (unless ekg-agent--running-p
+    (user-error "No agent is currently running"))
+  (setq ekg-agent--cancelled-p t)
+  ;; Kill the in-flight LLM request.
+  (when ekg-agent--current-request
+    (ignore-errors (llm-cancel-request ekg-agent--current-request))
+    (setq ekg-agent--current-request nil))
+  ;; Kill any active tool subprocesses.
+  (dolist (proc ekg-agent--tool-processes)
+    (when (process-live-p proc)
+      (ignore-errors (delete-process proc))))
+  (setq ekg-agent--tool-processes nil)
+  ;; Clean up orphaned tool-use interactions from the prompt.
+  (when ekg-agent--prompt
+    (ekg-agent--clean-orphaned-tool-interactions ekg-agent--prompt))
+  ;; Mark as stopped and fire the status callback exactly once.
+  (setq ekg-agent--running-p nil)
+  (ekg-agent--log "Agent force-cancelled")
+  (when ekg-agent--status-callback
+    (funcall ekg-agent--status-callback "force cancelled")))
 
 (defun ekg-agent-evaluate-status-daily ()
   "Run the ekg agent to evaluate status as a daily routine."
