@@ -37,6 +37,14 @@
 (require 'seq)
 (require 'json)
 (require 'subr-x)
+
+(when (featurep 'ns)
+  ;; Disable futur's background thread before loading: on macOS NS port,
+  ;; `message' (or any redisplay) from a non-main thread causes an NSException →
+  ;; GIL deadlock.  With this nil, futur dispatches all callbacks via
+  ;; `run-with-timer' on the main thread instead.
+  (defvar futur-use-threads)
+  (setq futur-use-threads nil))
 (require 'futur)
 
 ;; Forward declarations for variables defined later in this file.
@@ -626,6 +634,10 @@ PATH should already be resolved via `file-truename'."
                  return i)
         (error "Line identifier %s not found in %s" id path))))
 
+(defun ekg-agent--nonempty-string-p (s)
+  "Return non-nil if S is a non-nil, non-empty string."
+  (and (stringp s) (not (string-empty-p s))))
+
 (defun ekg-agent--read-file (path &optional begin end range-type)
   "Read file at PATH, returning contents with line identifiers.
 
@@ -635,10 +647,16 @@ read from the buffer.
 
 BEGIN and END restrict the output to a range.  RANGE-TYPE is
 either \"line_number\" or \"identifier\" and indicates how to
-interpret BEGIN and END.  Returns a string without text
+interpret BEGIN and END.  Empty strings for BEGIN, END, or
+RANGE-TYPE are treated as nil.  Returns a string without text
 properties."
   (ekg-agent--with-error-as-text
-    (let ((truepath (file-truename path)))
+    (let* ((truepath (file-truename path))
+           ;; LLMs sometimes pass empty strings for omitted optional args.
+           (begin (and (ekg-agent--nonempty-string-p begin) begin))
+           (end (and (ekg-agent--nonempty-string-p end) end))
+           (range-type (and (ekg-agent--nonempty-string-p range-type)
+                            range-type)))
       (unless (or (find-buffer-visiting truepath) (file-exists-p truepath))
         (error "File not found: %s" path))
       (unless (or (find-buffer-visiting truepath) (file-readable-p truepath))
@@ -773,6 +791,34 @@ identifiers."
            (:name "end_text" :type string :description "The text on the end line that marks the end of the region to replace (inclusive)." :required t)
            (:name "replacement" :type string :description "The new text to insert in place of the matched region." :required t))))
 
+(defun ekg-agent--write-file (path content)
+  "Write CONTENT to the file at PATH, creating it if necessary.
+If PATH is open in an Emacs buffer, replace the buffer contents
+without saving.  Otherwise write directly to disk, creating parent
+directories as needed.  Returns the file content with line
+identifiers, like `ekg-agent--read-file'."
+  (ekg-agent--with-error-as-text
+    (let ((truepath (file-truename
+                     (expand-file-name path))))
+      (let ((buf (find-buffer-visiting truepath)))
+        (if buf
+            (with-current-buffer buf
+              (erase-buffer)
+              (insert content))
+          (let ((dir (file-name-directory truepath)))
+            (unless (file-directory-p dir)
+              (make-directory dir t))
+            (write-region content nil truepath))))
+      (ekg-agent--read-file truepath))))
+
+(defconst ekg-agent-tool-write-file
+  (make-llm-tool
+   :function #'ekg-agent--write-file
+   :name "write_file"
+   :description "Write content to a file, creating it (and parent directories) if it does not exist.  If the file is already open in an Emacs buffer, replaces the buffer contents without saving.  Returns the new file content with line identifiers."
+   :args '((:name "path" :type string :description "The file path to write." :required t)
+           (:name "content" :type string :description "The full text content to write to the file." :required t))))
+
 (defun ekg-agent--run-command (callback command &optional directory)
   "Run shell COMMAND asynchronously and call CALLBACK with the result.
 DIRECTORY, if given, is used as `default-directory' for the process."
@@ -821,7 +867,8 @@ DIRECTORY, if given, is used as `default-directory' for the process."
    ekg-agent-tool-ask-user
    ekg-agent-tool-read-agents-md
    ekg-agent-tool-read-file
-   ekg-agent-tool-edit-file)
+   ekg-agent-tool-edit-file
+   ekg-agent-tool-write-file)
   "List of base tools available to the agent.
 These tools are necessary for basic agent functionality.")
 
@@ -850,10 +897,12 @@ agent will decide which is best."
                          "\n\nYour instructions are to answer the user's question, given below. "
                          "You have access to tools to help you. "
                          "After each tool call you will be given a chance to make more tool calls. "
-                         "When you have the answer, you MUST present it to the user by calling either "
-                         "`display_result_in_popup` or `create_note`.  Calling one of these tools "
-                         "will complete your task.  Do not call any other tools after you have "
-                         "presented the answer."
+                         "Use `create_note` freely throughout your work to record progress, "
+                         "findings, and skills — it will NOT end your session. "
+                         "When you are FINISHED with ALL work (including the actual task, any "
+                         "skill notes, and your retrospective), call `display_result_in_popup` "
+                         "to present your final summary to the user.  This is the ONLY way to "
+                         "end your session."
                          (when context
                            "\n\nHere is some additional context to help you:\n")
                          context
@@ -871,7 +920,7 @@ agent will decide which is best."
                          :tool-options (make-llm-tool-options :tool-choice 'any))
                         0
                         (ekg-agent--make-status-callback)
-                        '("display_result_in_popup" "create_note")
+                        '("display_result_in_popup")
                         (ekg-agent--timeout-deadline))))
 
 (defun ekg-agent-ask (question)
@@ -1033,7 +1082,16 @@ Before you begin any substantive work on a task:
      skills, or projects mentioned in the task description.  Each of
      these will have a tag cotagged with the prompt tag.  Existing
      cotags with the prompt tag are: %s.
+   - When working with specific files, check for file resource notes.
+     These are notes whose ID is `file:<absolute-path>` and are tagged
+     with `doc/<filename>`.  Use `get_note_by_id` with `file:<path>`
+     or search for notes with the `doc/<filename>` tag.  These notes
+     contain file-specific conventions and instructions.
    - If you find relevant notes, reference them in your task description.
+   - **CONTRADICTION HANDLING**: If your task instructions conflict
+     with conventions stored in ekg notes (especially `prompt`-tagged
+     skill notes), you MUST call `ask_user` to confirm which to follow
+     before proceeding.  Never silently override a stored convention.
 
 2. **CREATE INITIAL TASK NOTE**
    - Create a new note with:
@@ -1051,10 +1109,23 @@ Before you begin any substantive work on a task:
    - When you hit a problem or make a decision: document the rationale.
    - Be specific: include file paths, code snippets, key insights, and context.
 
-4. **CREATE NEW NOTES FOR GENERAL KNOWLEDGE**
-   - If you discover something that will help with other tasks (not just this one): create a new note.
-   - Tag it appropriately (e.g., `skill/<new skill>`, `<project>/lessons`).
-   - Link back to the task note if relevant.
+4. **CREATE SKILL NOTES FOR REUSABLE KNOWLEDGE**
+   Any time you discover something generally useful — a pattern,
+   convention, gotcha, best practice, or technique — you MUST create
+   a **skill note** so it will be automatically shown in future tasks.
+
+   A skill note is a note tagged with `%s` plus one or more topic
+   tags (e.g., `elisp`, `performance`, `error-handling`, or a project
+   name).  Notes tagged with `%s` are special: they are automatically
+   included as instructions when the agent works on tasks that share
+   any of the co-tags.  This is how the agent learns and improves
+   over time.
+
+   Examples of when to create a skill note:
+   - You discover a performance anti-pattern (tag: `%s` + `elisp` + `performance`)
+   - You identify a project convention (tag: `%s` + `<project-name>`)
+   - You learn a useful technique (tag: `%s` + relevant topic)
+   - Your instructions could be improved (tag: `%s` + relevant context)
 
 In org-mode, you can link to a note with `[[ekg-note:<id>][<link display
 text>]]`.  Tags can be linked with `[[ekg-tag:<tag>][<link display
@@ -1063,17 +1134,26 @@ text>]]`.
 In markdown mode, there's no way to link directly to notes, but you can
 use [[tag]] to link to a tag.
 
+== SUBAGENT MEMORY HANDOFF ==
+
+When delegating work to a sub-agent via `run_subagent`:
+- **Before** spawning the subagent, ensure all relevant context
+  (project conventions, decisions, file locations) is stored in ekg
+  notes with appropriate tags so the subagent can find them.
+- In the subagent instructions, mention which ekg tags to search for
+  context (e.g., \"Check notes tagged with 'widget-maker' for project
+  conventions\").
+- The subagent has full access to ekg tools and follows the same memory
+  workflow, so it will search for and create notes.
+
 == FINAL STEPS (DO NOT SKIP) ==
 
 When the task is complete:
 
 5. **RETROSPECTIVE AND KNOWLEDGE EXTRACTION**
    - Ask: what did I learn that's generally useful?
-   - Convert those learnings into standalone notes with appropriate tags
-   - If something went wrong, document the lesson
-   - If my instructions could be improved, create or edit notes tagged
-     with `%s` and other tags that will allow you to later use it in the
-     correct contexts.
+   - For each learning, create a skill note (tagged with `%s` + topics).
+   - If something went wrong, document the lesson as a skill note.
 
 6. **UPDATE THE TASK NOTE**
    - Add a final entry summarizing the outcome
@@ -1096,7 +1176,13 @@ When creating a note, text that you add will automatically have the tags
 surrounding it to indicate that it was written by an LLM.  Do not add
 these tags manually."
      (concat "[" (string-join (ekg-agent-cotagged-prompt-tags) " ") "]")
-     ekg-llm-prompt-tag
+     ekg-llm-prompt-tag  ; step 4 first mention
+     ekg-llm-prompt-tag  ; step 4 "Notes tagged with..."
+     ekg-llm-prompt-tag  ; step 4 example 1
+     ekg-llm-prompt-tag  ; step 4 example 2
+     ekg-llm-prompt-tag  ; step 4 example 3
+     ekg-llm-prompt-tag  ; step 4 example 4
+     ekg-llm-prompt-tag  ; step 5
      timeout-desc
      ekg-agent-self-info-tag)))
 
@@ -1600,49 +1686,54 @@ NUM is the maximum number of notes to return (default 10).
 
 Returns a list of note objects."
   (ekg-connect)
-  (cond
-   ;; Latest modified notes
-   (latest
-    (ekg-get-latest-modified num))
+  ;; The agent must be able to find its own self-info notes even when
+  ;; searching by other tags.  ekg-hidden-tags causes notes with
+  ;; agent/self-info to be filtered out of normal tag queries, so we
+  ;; remove that tag from the hidden list within agent tool context.
+  (let ((ekg-hidden-tags (remove ekg-agent-self-info-tag ekg-hidden-tags)))
+    (cond
+     ;; Latest modified notes
+     (latest
+      (ekg-get-latest-modified num))
 
-   ;; Read by note ID
-   (note-id
-    (let ((note (ekg-get-note-with-id (if (stringp note-id)
-                                          (string-to-number note-id)
-                                        note-id))))
-      (if note
-          (list note)
-        (error "Note with ID %s not found" note-id))))
+     ;; Read by note ID
+     (note-id
+      (let ((note (ekg-get-note-with-id (if (stringp note-id)
+                                            (string-to-number note-id)
+                                          note-id))))
+        (if note
+            (list note)
+          (error "Note with ID %s not found" note-id))))
 
-   ;; Semantic search (requires embeddings)
-   (semantic-search
-    (unless ekg-embedding-provider
-      (error "Semantic search requires ekg-embedding-provider to be configured"))
-    (let ((embedding (llm-embedding ekg-embedding-provider semantic-search)))
-      (mapcar #'ekg-get-note-with-id
-              (ekg-embedding-n-most-similar-notes embedding num))))
+     ;; Semantic search (requires embeddings)
+     (semantic-search
+      (unless ekg-embedding-provider
+        (error "Semantic search requires ekg-embedding-provider to be configured"))
+      (let ((embedding (llm-embedding ekg-embedding-provider semantic-search)))
+        (mapcar #'ekg-get-note-with-id
+                (ekg-embedding-n-most-similar-notes embedding num))))
 
-   ;; Text search (full-text search)
-   (text-search
-    (seq-take
-     (seq-filter #'ekg-note-active-p
-                 (mapcar #'ekg-get-note-with-id
-                         (triples-fts-query-subject ekg-db text-search ekg-query-pred-abbrevs)))
-     num))
+     ;; Text search (full-text search)
+     (text-search
+      (seq-take
+       (seq-filter #'ekg-note-active-p
+                   (mapcar #'ekg-get-note-with-id
+                           (triples-fts-query-subject ekg-db text-search ekg-query-pred-abbrevs)))
+       num))
 
-   ;; Tag-based search with OR logic (already sorted by creation time)
-   (any-tags
-    (seq-take (ekg-get-notes-with-any-tags any-tags) num))
+     ;; Tag-based search with OR logic (already sorted by creation time)
+     (any-tags
+      (seq-take (ekg-get-notes-with-any-tags any-tags) num))
 
-   ;; Tag-based search (AND logic)
-   (tags
-    (seq-take (sort (ekg-get-notes-with-tags tags)
-                    #'ekg-sort-by-creation-time)
-              num))
+     ;; Tag-based search (AND logic)
+     (tags
+      (seq-take (sort (ekg-get-notes-with-tags tags)
+                      #'ekg-sort-by-creation-time)
+                num))
 
-   ;; No search criteria
-   (t
-    (error "Must provide tags, any-tags, note-id, semantic-search, text-search, or latest"))))
+     ;; No search criteria
+     (t
+      (error "Must provide tags, any-tags, note-id, semantic-search, text-search, or latest")))))
 
 ;;;###autoload
 (cl-defun ekg-agent-read-notes (&key tags note-id semantic-search text-search latest (num 10) (max-words 100))
