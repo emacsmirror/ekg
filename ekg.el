@@ -579,10 +579,11 @@ Draft notes are not returned, unless TAGS contains the draft tag."
                     (and (not (member hidden-tag tags))
                          (member hidden-tag (ekg-note-tags note))))
                   ekg-hidden-tags)))
-     (mapcar #'ekg-get-note-with-id
-             (seq-reduce #'seq-intersection
-                         ids-by-tag
-                         (car ids-by-tag))))))
+     (delq nil
+           (mapcar #'ekg-get-note-with-id
+                   (seq-reduce #'seq-intersection
+                               ids-by-tag
+                               (car ids-by-tag)))))))
 
 (defun ekg-get-notes-with-tag (tag)
   "Get all notes with TAG, returning a list of `ekg-note' structs."
@@ -605,59 +606,60 @@ Draft notes are not returned, unless TAGS contains the draft tag."
   (triples-get-subject ekg-db id))
 
 (defun ekg-get-note-with-id (id)
-  "Get the specific note with ID.
-If the ID does not exist, create a new note with that ID."
+  "Get the note with ID, or nil if it does not exist."
   (ekg-connect)
-  (let* ((v (triples-get-subject ekg-db id))
-         (stored-types (triples-get-types ekg-db id))
-         (core-types '(text time-tracked inline titled tagged))
-         (inlines (mapcar (lambda (iid)
-                            (let ((iv (triples-get-type ekg-db iid
-                                                        'inline)))
-                              (make-ekg-inline :pos (plist-get iv :pos)
-                                               :command (cons
-                                                         (plist-get iv :command)
-                                                         (plist-get iv :args))
-                                               :type (plist-get iv :type))))
-                          (plist-get v :text/inlines)))
-         ;; Query extension types not already returned by triples-get-subject,
-         ;; to pick up virtual reversed properties like org/children.
-         (extra-props
-          (mapcan (lambda (type)
-                    (unless (or (memq type stored-types)
-                                (memq type core-types))
-                      (let ((type-data (triples-get-type ekg-db id type)))
-                        (when type-data
-                          (cl-loop for (k v) on type-data by #'cddr
-                                   nconc (list (intern (format ":%s/%s" type
-                                                               (substring (symbol-name k) 1)))
-                                               v))))))
-                  (ekg-note-cotypes))))
-    (make-ekg-note :id id
-                   :text (plist-get v :text/text)
-                   :mode (plist-get v :text/mode)
-                   :inlines inlines
-                   :tags (plist-get v :tagged/tag)
-                   :creation-time (plist-get v :time-tracked/creation-time)
-                   :modified-time (plist-get v :time-tracked/modified-time)
-                   :properties (append
-                                (map-into
-                                 (map-filter
-                                  (lambda (plist-key _)
-                                    (not (member plist-key
-                                                 '(:text/text
-                                                   :text/mode
-                                                   :text/inlines
-                                                   :tagged/tag
-                                                   :time-tracked/creation-time
-                                                   :time-tracked/modified-time)))) v)
-                                 'plist)
-                                extra-props))))
+  (let ((v (triples-get-subject ekg-db id)))
+    (when v
+      (let* ((stored-types (triples-get-types ekg-db id))
+             (core-types '(text time-tracked inline titled tagged))
+             (inlines (mapcar (lambda (iid)
+                                (let ((iv (triples-get-type ekg-db iid
+                                                            'inline)))
+                                  (make-ekg-inline :pos (plist-get iv :pos)
+                                                   :command (cons
+                                                             (plist-get iv :command)
+                                                             (plist-get iv :args))
+                                                   :type (plist-get iv :type))))
+                              (plist-get v :text/inlines)))
+             ;; Query extension types not already returned by
+             ;; triples-get-subject, to pick up virtual reversed
+             ;; properties like org/children.
+             (extra-props
+              (mapcan (lambda (type)
+                        (unless (or (memq type stored-types)
+                                    (memq type core-types))
+                          (let ((type-data (triples-get-type ekg-db id type)))
+                            (when type-data
+                              (cl-loop for (k v) on type-data by #'cddr
+                                       nconc (list (intern (format ":%s/%s" type
+                                                                   (substring (symbol-name k) 1)))
+                                                   v))))))
+                      (ekg-note-cotypes))))
+        (make-ekg-note :id id
+                       :text (plist-get v :text/text)
+                       :mode (plist-get v :text/mode)
+                       :inlines inlines
+                       :tags (plist-get v :tagged/tag)
+                       :creation-time (plist-get v :time-tracked/creation-time)
+                       :modified-time (plist-get v :time-tracked/modified-time)
+                       :properties (append
+                                    (map-into
+                                     (map-filter
+                                      (lambda (plist-key _)
+                                        (not (member plist-key
+                                                     '(:text/text
+                                                       :text/mode
+                                                       :text/inlines
+                                                       :tagged/tag
+                                                       :time-tracked/creation-time
+                                                       :time-tracked/modified-time)))) v)
+                                     'plist)
+                                    extra-props))))))
 
 (defun ekg-get-notes-with-title (title)
   "Get a list of note structs with TITLE."
   (ekg-connect)
-  (mapcar #'ekg-get-note-with-id (triples-subjects-with-predicate-object ekg-db 'titled/title title)))
+  (delq nil (mapcar #'ekg-get-note-with-id (triples-subjects-with-predicate-object ekg-db 'titled/title title))))
 
 (defun ekg-note-delete (note)
   "Delete NOTE from the database."
@@ -717,10 +719,11 @@ Those tags are things such as `ekg-draft-tag', or `ekg-function-tag'."
 
 (defun ekg-active-id-p (id)
   "Return non-nil if the note with ID is active.
-This will return true if the note is not a draft, and has at
-least one non-trash tag."
+This will return true if the note exists, is not a draft, and has
+at least one non-trash tag."
   (ekg-connect)
-  (ekg-note-active-p (ekg-get-note-with-id id)))
+  (let ((note (ekg-get-note-with-id id)))
+    (and note (ekg-note-active-p note))))
 
 (defun ekg-live-id-p (sub)
   "Return non-nil if SUB represents an undeleted note."
@@ -958,7 +961,9 @@ NUMWORDS and FORMAT are as described in `ekg-display-note-template'."
 (defun ekg-inline-command-transclude-note (id &optional numwords)
   "Return the text of ID.
 NUMWORDS is the maximum number of words to use."
-  (string-trim-right (ekg-display-note-text (ekg-get-note-with-id id) numwords) "\n"))
+  (if-let* ((note (ekg-get-note-with-id id)))
+      (string-trim-right (ekg-display-note-text note numwords) "\n")
+    (format "[Note %s not found]" id)))
 
 (defun ekg-inline-command-transclude-file (file &optional numwords)
   "Return the contents of FILE.
@@ -1852,7 +1857,8 @@ Raise an error if there is no current note."
   (unless (eq major-mode 'ekg-notes-mode)
     (error "This command can only be used in `ekg-notes-mode'"))
   (if-let* ((id (get-text-property (point) :ekg-note-id)))
-      (ekg-get-note-with-id id)
+      (or (ekg-get-note-with-id id)
+          (error "Note with ID %s no longer exists" id))
     (error "No current note is available to act on!  Create a new note first with `ekg-capture'")))
 
 (declare-function ekg-org-view--note-at-point "ekg-org")
@@ -1868,7 +1874,8 @@ intended to be used in any context where a note might be available."
            ekg-note)
       (and (derived-mode-p 'ekg-org-view-mode)
            (let ((id (ekg-org-view--note-at-point)))
-             (if id (ekg-get-note-with-id id)
+             (if id (or (ekg-get-note-with-id id)
+                        (error "Note with ID %s no longer exists" id))
                (error "No task at point"))))
       (error "No current note found in context")))
 
@@ -2150,7 +2157,7 @@ Text included in inline templates is not searched."
   (ekg-connect)
   (ekg-setup-notes-buffer
    (format "query: %s" query)
-   (lambda () (seq-filter #'ekg-note-active-p (mapcar #'ekg-get-note-with-id (triples-fts-query-subject ekg-db query ekg-query-pred-abbrevs)))) nil))
+   (lambda () (seq-filter #'ekg-note-active-p (delq nil (mapcar #'ekg-get-note-with-id (triples-fts-query-subject ekg-db query ekg-query-pred-abbrevs))))) nil))
 
 ;;;###autoload
 (defun ekg-show-notes-in-trash ()
@@ -2318,11 +2325,12 @@ Returns a list of matching notes, up to LIMIT if provided."
   (let ((plainquery (substring-no-properties query))
         (limit (or limit ekg-search-max-results)))
     (ekg-connect)
-    (mapcar #'ekg-get-note-with-id
-            (seq-difference
-             (mapcar #'car (seq-union (triples-search ekg-db :text/text plainquery limit)
-                                      (triples-search ekg-db :titled/title plainquery limit)))
-             (ekg-inactive-note-ids)))))
+    (delq nil
+          (mapcar #'ekg-get-note-with-id
+                  (seq-difference
+                   (mapcar #'car (seq-union (triples-search ekg-db :text/text plainquery limit)
+                                            (triples-search ekg-db :titled/title plainquery limit)))
+                   (ekg-inactive-note-ids))))))
 
 (defun ekg-show-notes-with-search-results (query)
   "Show notes that match the search QUERY."
@@ -2542,13 +2550,15 @@ as long as those notes aren't on resources that are interesting.
   (cl-loop for id in (triples-subjects-of-type ekg-db 'text) do
            (let ((note (ekg-get-note-with-id id))
                  (deleted))
-             (unless (ekg-note-text note)
+             (unless (and note (ekg-note-text note))
                ;; As a heuristic, if this note is sufficiently weird that
                ;; there's no creation date, delete it, otherwise try to fix it.
-               (if (null (ekg-note-creation-time note))
+               (if (or (null note) (null (ekg-note-creation-time note)))
                    (progn
                      (message "ekg-clean-db: Deleting note %s, reason: no text or creation date" id)
-                     (ekg-note-delete note)
+                     (if note
+                         (ekg-note-delete note)
+                       (triples-delete-subject ekg-db id))
                      (setq deleted t))
                  (message "ekg-clean-db: Fixed nil text for note %s" id)
                  (setf (ekg-note-text note) "")
@@ -2628,7 +2638,10 @@ STAGS is a string version of a tag, as stored in a link."
 
 (defun ekg--open-note-link (id)
   "Open a link to a note given its ID."
-  (ekg-edit (ekg-get-note-with-id (read id))))
+  (let ((note (ekg-get-note-with-id (read id))))
+    (if note
+        (ekg-edit note)
+      (error "Note with ID %s not found" id))))
 
 (org-link-set-parameters "ekg-tag" :follow #'ekg--open-tag-link
                          :store #'ekg--store-tag-link)

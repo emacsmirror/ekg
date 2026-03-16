@@ -156,13 +156,13 @@ active, unarchived, tasks."
                  (if archive
                      (member ekg-org-archive-tag tags)
                    (not (member ekg-org-archive-tag tags))))))))
-     (mapcar #'ekg-get-note-with-id top-ids))))
+     (delq nil (mapcar #'ekg-get-note-with-id top-ids)))))
 
 (defun ekg-org-get-child-notes-of-id (id)
   "Fetch child notes of a given note ID."
   (seq-filter #'ekg-note-active-p
-              (mapcar (lambda (row) (ekg-get-note-with-id (car row)))
-                      (triples-db-select ekg-db nil 'org/parent id))))
+              (delq nil (mapcar (lambda (row) (ekg-get-note-with-id (car row)))
+                                (triples-db-select ekg-db nil 'org/parent id)))))
 
 (defun ekg-org--format-timestamp (timestamp)
   "Parse TIMESTAMP integer into an Org timestamp string."
@@ -826,8 +826,9 @@ trashed, they are permanently deleted."
   "Create a new sibling task after the task at point."
   (interactive)
   (let* ((id (ekg-org-view--note-at-point))
-         (parent-id (when id
-                      (plist-get (ekg-note-properties (ekg-get-note-with-id id))
+         (note (when id (ekg-get-note-with-id id)))
+         (parent-id (when note
+                      (plist-get (ekg-note-properties note)
                                  :org/parent)))
          (siblings (if parent-id
                        (ekg-org-view--sorted-children parent-id)
@@ -930,10 +931,9 @@ skipped."
             (unless (member id seen-ids)
               (push id seen-ids)
               (push (list (point) id level
-                          (when id
-                            (plist-get (ekg-note-properties
-                                       (ekg-get-note-with-id id))
-                                      :org/parent)))
+                          (when-let* ((note (and id (ekg-get-note-with-id id))))
+                            (plist-get (ekg-note-properties note)
+                                       :org/parent)))
                     headings))))
         (forward-line 1)))
     (nreverse headings)))
