@@ -246,16 +246,31 @@ tool call."
                  :description "List all existing tags in the ekg database."
                  :args '((:name "regex_filter" :type string :description "Optional regex to filter the tags by"))))
 
+(defun ekg-agent--note-exists-p (note)
+  "Return non-nil if NOTE represents an actual stored note.
+`ekg-get-note-with-id' always returns a struct even for
+nonexistent IDs, so we check for a creation-time to distinguish
+real notes from empty shells."
+  (and note (ekg-note-creation-time note)))
+
 (defun ekg-agent--get-note-with-id (id)
   "Retrieve the note with string ID, handling different ID types.
 
-This tries a few different things, since ekg ids can of various types,
-but we'll only get strings from the LLM."
-  (or (ekg-get-note-with-id id)
+This tries a few different things, since ekg ids can be of various
+types, but we'll only get strings from the LLM.
+`ekg-get-note-with-id' always returns a struct even when the ID
+doesn't exist, so we verify the note has data before accepting it."
+  (let ((note (ekg-get-note-with-id id)))
+    (if (ekg-agent--note-exists-p note)
+        note
       (let ((int-id (string-to-number id)))
         (when (> int-id 0)
-          (ekg-get-note-with-id int-id)))
-      (ekg-get-note-with-id (intern id))))
+          (setq note (ekg-get-note-with-id int-id))))
+      (if (ekg-agent--note-exists-p note)
+          note
+        (setq note (ekg-get-note-with-id (intern id)))
+        (when (ekg-agent--note-exists-p note)
+          note)))))
 
 (defconst ekg-agent-tool-append-to-note
   (make-llm-tool :function (lambda (id content)
