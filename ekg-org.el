@@ -557,7 +557,7 @@ Reuses a hidden buffer to avoid repeated `org-mode' initialization."
          (body-nodes nil))
     (unless collapsed
       (when (and text (not (string-empty-p (string-trim text))))
-        (let* ((fontified (ekg-org-view--fontify-org text))
+        (let* ((fontified (string-trim-right (ekg-org-view--fontify-org text)))
                (indent (make-string (1+ level) ?\s))
                (body (ekg-org-view--indent-text fontified indent)))
           (push (vui-text body
@@ -1036,7 +1036,9 @@ If TITLE is non-nil and non-empty, show it; otherwise show hint text."
   "Update overlay OV at POS to show insertion placeholder at LEVEL.
 If TITLE is given, display it in the placeholder."
   (let ((placeholder (ekg-org-view--insert-placeholder-string level title))
-        (at-end (>= pos (point-max))))
+        (at-end (>= pos (point-max)))
+        ;; Top-level items have blank-line spacing between them.
+        (top-level-p (= level 1)))
     (move-overlay ov pos pos)
     ;; At end of buffer, we need a preceding newline since there's no
     ;; following line to attach before-string to.  Use after-string
@@ -1044,9 +1046,11 @@ If TITLE is given, display it in the placeholder."
     (if at-end
         (progn
           (overlay-put ov 'before-string nil)
-          (overlay-put ov 'after-string (concat "\n" placeholder)))
+          (overlay-put ov 'after-string
+                       (concat (if top-level-p "\n\n" "\n") placeholder)))
       (overlay-put ov 'after-string nil)
-      (overlay-put ov 'before-string (concat placeholder "\n")))))
+      (overlay-put ov 'before-string
+                   (concat placeholder (if top-level-p "\n\n" "\n"))))))
 
 (defun ekg-org-view--insert-show ()
   "Display the placeholder overlay at the current insertion slot."
