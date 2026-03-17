@@ -721,12 +721,31 @@ as the starting heading are skipped."
 
 ;; Interactive action commands
 
-(defun ekg-org-view--refresh ()
-  "Re-render the view in place without switching windows."
+(defun ekg-org-view--goto-note-id (id)
+  "Move point to the heading for note ID, if present in the buffer.
+Returns non-nil if found."
+  (let ((found nil))
+    (save-excursion
+      (goto-char (point-min))
+      (while (and (not found) (not (eobp)))
+        (when (and (equal (get-text-property (point) :ekg-org-note-id) id)
+                   (get-text-property (point) :ekg-org-heading))
+          (setq found (point)))
+        (forward-line 1)))
+    (when found
+      (goto-char found)
+      t)))
+
+(defun ekg-org-view--refresh (&optional target-id)
+  "Re-render the view in place without switching windows.
+If TARGET-ID is non-nil, move point to that note's heading after
+re-rendering and ensure it is visible."
   (let ((pos (point)))
     (vui-rerender ekg-org-view--instance)
-    (goto-char (min pos (point-max)))
-    (ekg-org-view--ensure-on-heading)
+    (if (and target-id (ekg-org-view--goto-note-id target-id))
+        (recenter)
+      (goto-char (min pos (point-max)))
+      (ekg-org-view--ensure-on-heading))
     (ekg-org-view--highlight)))
 
 (defun ekg-org-view-toggle-collapse ()
@@ -867,7 +886,9 @@ trashed, they are permanently deleted."
     (nreverse result)))
 
 (defun ekg-org-view-promote ()
-  "Promote the task at point, making it a sibling of its current parent."
+  "Promote the task at point, making it a sibling of its current parent.
+The promoted task is placed immediately after its former parent
+among the new siblings."
   (interactive)
   (when-let* ((id (ekg-org-view--note-at-point))
               (note (ekg-get-note-with-id id))
@@ -888,8 +909,15 @@ trashed, they are permanently deleted."
           (setf (ekg-note-properties note)
                 (ekg-org-view--plist-delete props :org/parent))
           (triples-db-delete ekg-db id 'org/parent))
+        ;; Place right after the former parent among new siblings.
+        (let* ((new-siblings (if grandparent-id
+                                 (ekg-org-view--sorted-children grandparent-id)
+                               (ekg-org-view--sorted-top-level)))
+               (sort-order (ekg-org-view--assign-order-after
+                            new-siblings parent-id)))
+          (ekg-org-view--set-sort-order id sort-order))
         (ekg-save-note note)))
-    (ekg-org-view--refresh)))
+    (ekg-org-view--refresh id)))
 
 (defun ekg-org-view-demote ()
   "Demote the task at point, making it a child of the previous sibling."
