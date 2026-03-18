@@ -245,7 +245,7 @@ an ekg-note and returns nil to exclude it."
   "Change the state of the current org task to NEW-STATE.
 
 NEW-STATE is one of the standard org states."
-  (interactive (list (completing-read "New state: " org-todo-keywords-1)))
+  (interactive (list (completing-read "New state: " (ekg-org--todo-keywords))))
   (let ((ekg-note (ekg-current-note-or-error-expanded)))
     (setf (ekg-note-tags ekg-note)
           (cons
@@ -398,6 +398,24 @@ Does nothing when `ekg-org--inhibit-view-refresh' is non-nil."
 ;; We need archive to open up as org, and it doesn't by default, which is odd.
 ;; But without this, we get an error.
 (add-to-list 'auto-mode-alist '("\\.org_archive" . org-mode))
+
+(defun ekg-org--todo-keywords ()
+  "Return a flat list of TODO keyword strings from `org-todo-keywords'.
+This reads directly from the global defcustom rather than the
+buffer-local `org-todo-keywords-1', which is only populated inside
+Org-mode buffers."
+  (let (result)
+    (dolist (entry (default-value 'org-todo-keywords))
+      (if (stringp entry)
+          ;; Old-style plain keyword list.
+          (push entry result)
+        ;; New-style (sequence/type "KW1" "|" "KW2" ...) entry.
+        (dolist (kw (cdr entry))
+          (unless (equal kw "|")
+            ;; Strip fast-selection key / logging specs, e.g. "WAIT(w@/!)".
+            (when (string-match "^\\([^(]+\\)" kw)
+              (push (match-string 1 kw) result))))))
+    (nreverse result)))
 
 (defun ekg-org--state (note)
   "Get the org state of NOTE."
@@ -767,7 +785,7 @@ re-rendering and ensure it is visible."
   (interactive)
   (when-let* ((id (ekg-org-view--note-at-point))
               (note (ekg-get-note-with-id id)))
-    (let* ((states (or org-todo-keywords-1 '("TODO" "DONE")))
+    (let* ((states (or (ekg-org--todo-keywords) '("TODO" "DONE")))
            (new-state (completing-read "State: " states nil t))
            (ekg-org--inhibit-view-refresh t))
       (setf (ekg-note-tags note)
