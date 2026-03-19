@@ -2010,6 +2010,14 @@ add properly formatted notes to ekg."
     (message "Agent note created with ID: %s" (ekg-note-id note))
     (ekg-note-id note)))
 
+(defun ekg-agent--filter-properties (props)
+  "Filter PROPS plist, removing large internal properties like embeddings."
+  (let (result)
+    (cl-loop for (key val) on props by #'cddr
+             unless (eq key :embedding/embedding)
+             do (setq result (plist-put result key val)))
+    result))
+
 (defun ekg-agent--note-to-alist (note &optional max-words)
   "Convert NOTE to an alist suitable for JSON encoding.
 If MAX-WORDS is specified, truncate the text to that many words."
@@ -2024,7 +2032,7 @@ If MAX-WORDS is specified, truncate the text to that many words."
       (tags . ,(ekg-note-tags note))
       (creation_time . ,(ekg-note-creation-time note))
       (modified_time . ,(ekg-note-modified-time note))
-      (properties . ,(ekg-note-properties note)))))
+      (properties . ,(ekg-agent--filter-properties (ekg-note-properties note))))))
 
 (defun ekg-agent--notes-to-json (notes &optional max-words)
   "Convert list of NOTES to a JSON array string.
