@@ -1280,6 +1280,7 @@ The agent has access to all the ekg tools, and can create notes
 or display results in a popup buffer.  The agent will decide
 which is best."
   (interactive "sQuestion: ")
+  (ekg-connect)
   (ekg-agent--ask question
                   (concat
                    "The last 10 notes:\n\n"
@@ -1295,6 +1296,7 @@ note at point if in a `ekg-notes-mode` buffer.
 EXTRA-TOOLS is a list of additional tools to make available to the
 agent."
   (interactive "sQuestion: \n")
+  (ekg-connect)
   (let* ((note (or (and id (ekg-agent--get-note-with-id id))
                    (ekg-current-note-or-error-expanded)))
          (note-text (ekg-llm-note-to-text note))
@@ -1317,6 +1319,7 @@ agent."
 (defun ekg-agent-ask-with-buffer (instructions)
   "Issue INSTRUCTIONS to the agent, with the current buffer as context."
   (interactive "sInstructions: ")
+  (ekg-connect)
   (ekg-agent--ask instructions
                   (concat
                    (format "The current buffer is named %s%s, the major mode is %s.  The content is:\n"
@@ -1330,6 +1333,7 @@ agent."
 (defun ekg-agent-ask-with-region (instructions start end)
   "Issue INSTRUCTIONS to the agent, with the region from START to END as context."
   (interactive "sInstructions: \nr")
+  (ekg-connect)
   (ekg-agent--ask instructions
                   (concat
                    (format "The current buffer is named %s%s, the major mode is %s.  The content is the selected region:\n"
