@@ -631,5 +631,114 @@ result when the agent finishes."
               (should (string-match-p "def greet" (buffer-string))))))
       (kill-buffer buf))))
 
+;; Web rendering / browsing / search
+
+(ert-deftest ekg-agent-test-web-render-html-basic ()
+  "Rendering simple HTML produces readable text."
+  (let ((result (ekg-agent--web-render-html
+                 "<html><body><p>Hello world</p></body></html>"
+                 "https://example.com")))
+    (should (stringp result))
+    (should (string-match-p "Hello world" result))))
+
+(ert-deftest ekg-agent-test-web-render-html-truncation ()
+  "Content exceeding `ekg-agent-web-max-chars' is truncated."
+  (let* ((ekg-agent-web-max-chars 50)
+         (long-text (make-string 200 ?x))
+         (html (format "<html><body><p>%s</p></body></html>" long-text))
+         (result (ekg-agent--web-render-html html "https://example.com")))
+    (should (<= (length result) (+ 50 100)))  ; truncated text + notice
+    (should (string-match-p "\\[Content truncated" result))))
+
+(ert-deftest ekg-agent-test-web-render-html-empty ()
+  "Rendering empty HTML returns a non-erroring result."
+  (let ((result (ekg-agent--web-render-html
+                 "<html><body></body></html>"
+                 "https://example.com")))
+    (should (stringp result))))
+
+(ert-deftest ekg-agent-test-web-browse-rejects-non-http ()
+  "Non-http(s) URLs are rejected with an error message."
+  (let (result)
+    (ekg-agent--web-browse (lambda (r) (setq result r)) "ftp://example.com/file")
+    (should (string-match-p "Error:.*Only http" result))))
+
+(ert-deftest ekg-agent-test-web-browse-rejects-file-url ()
+  "file:// URLs are rejected."
+  (let (result)
+    (ekg-agent--web-browse (lambda (r) (setq result r)) "file:///etc/passwd")
+    (should (string-match-p "Error:.*Only http" result))))
+
+(ert-deftest ekg-agent-test-web-browse-success ()
+  "A successful fetch renders and returns page content."
+  (let (result)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (url callback &optional _cbargs _silent)
+                 ;; Simulate a successful HTTP response in a temp buffer.
+                 (let ((buf (generate-new-buffer " *test-url-retrieve*")))
+                   (with-current-buffer buf
+                     (insert "HTTP/1.1 200 OK\nContent-Type: text/html\n\n"
+                             "<html><body><p>Search result</p></body></html>"))
+                   (with-current-buffer buf
+                     (funcall callback nil))
+                   buf))))
+      (ekg-agent--web-browse (lambda (r) (setq result r))
+                             "https://example.com/test"))
+    (should (stringp result))
+    (should (string-match-p "Search result" result))
+    (should (string-match-p "Content from https://example.com/test" result))))
+
+(ert-deftest ekg-agent-test-web-browse-http-error ()
+  "HTTP errors from url-retrieve are reported."
+  (let (result)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (_url callback &optional _cbargs _silent)
+                 (let ((buf (generate-new-buffer " *test-url-error*")))
+                   (with-current-buffer buf
+                     (funcall callback (list :error '(error http 404))))
+                   buf))))
+      (ekg-agent--web-browse (lambda (r) (setq result r))
+                             "https://example.com/missing"))
+    (should (string-match-p "Error fetching URL" result))))
+
+(ert-deftest ekg-agent-test-web-search-constructs-url ()
+  "Web search passes the correctly constructed search URL to web-browse."
+  (let (captured-url result)
+    (cl-letf (((symbol-function 'ekg-agent--web-browse)
+               (lambda (callback url)
+                 (setq captured-url url)
+                 (funcall callback (format "Content from %s:\n\nresults" url)))))
+      (ekg-agent--web-search (lambda (r) (setq result r)) "emacs lisp"))
+    (should (string-match-p "duckduckgo" captured-url))
+    (should (string-match-p "emacs" captured-url))
+    (should (string-match-p "lisp" captured-url))
+    (should (stringp result))))
+
+(ert-deftest ekg-agent-test-web-search-hexifies-query ()
+  "Web search properly hex-encodes special characters in the query."
+  (let (captured-url)
+    (cl-letf (((symbol-function 'ekg-agent--web-browse)
+               (lambda (callback url)
+                 (setq captured-url url)
+                 (funcall callback "ok"))))
+      (ekg-agent--web-search #'ignore "hello world & more"))
+    ;; Space should be %20, & should be %26
+    (should (string-match-p "%20" captured-url))
+    (should (string-match-p "%26" captured-url))
+    (should-not (string-match-p " " (replace-regexp-in-string
+                                     "https?://[^?]*\\?" ""
+                                     captured-url)))))
+
+(ert-deftest ekg-agent-test-web-search-custom-prefix ()
+  "Web search respects a custom `eww-search-prefix'."
+  (let ((eww-search-prefix "https://google.com/search?q=")
+        captured-url)
+    (cl-letf (((symbol-function 'ekg-agent--web-browse)
+               (lambda (callback url)
+                 (setq captured-url url)
+                 (funcall callback "ok"))))
+      (ekg-agent--web-search #'ignore "test"))
+    (should (string-match-p "^https://google.com/search\\?q=" captured-url))))
+
 (provide 'ekg-agent-test)
 ;;; ekg-agent-test.el ends here

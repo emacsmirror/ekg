@@ -1748,7 +1748,7 @@ session.  At iteration 0 the log buffer is created and
                            (funcall
                             status-callback
                             (mapconcat (lambda (end-tool)
-                                         (assoc-default end-tool result-alist))
+                                         (format "%s" (assoc-default end-tool result-alist)))
                                        (seq-filter (lambda (end-tool) (assoc-default end-tool result-alist))
                                                    end-tools)
                                        ", ")))))
