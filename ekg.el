@@ -1183,7 +1183,7 @@ This is needed to identify references to refresh when the subject is changed.")
                          (concat (propertize (ekg-property-name-for prop) 'face 'bold)
                                  ": "
                                  (if (listp value)
-                                     (mapconcat #'identity value ", ")
+                                     (mapconcat (lambda (v) (format "%s" v)) value ", ")
                                    (format "%s" value)))
                          remaining-width) parts)))
               (ekg-note-properties ekg-note))
@@ -1835,15 +1835,16 @@ tags)."
 
 (defun ekg--note-region-at-point ()
   "Return (START . END) of the note region at point, or nil."
-  (when (get-text-property (point) :ekg-note-id)
+  (when-let* ((id (get-text-property (point) :ekg-note-id)))
     (let ((start (or (previous-single-property-change (point) :ekg-note-id)
                      (point-min)))
           (end (or (next-single-property-change (point) :ekg-note-id)
                    (point-max))))
-      ;; If point is at the start of a note region, previous-single
-      ;; returns the end of the prior region; adjust.
-      (when (not (get-text-property start :ekg-note-id))
-        (setq start (point)))
+      ;; previous-single-property-change lands on the prior note (or
+      ;; gap); scan forward to find where our note actually begins.
+      (unless (equal (get-text-property start :ekg-note-id) id)
+        (setq start (or (next-single-property-change start :ekg-note-id)
+                        (point))))
       (cons start end))))
 
 (defun ekg--note-highlight ()
@@ -1950,13 +1951,32 @@ TITLE is the title of the URL to browse to."
   (let ((notes (funcall notes-func)))
     (apply #'vui-vstack
            :spacing 1
-           (vui-text (propertize name 'face 'ekg-notes-mode-title)
-             :key 'title)
            (mapcar (lambda (note)
                      (vui-text (ekg-display-note note ekg-display-note-template)
                        :key (intern (format "note-%s" (ekg-note-id note)))
                        :ekg-note-id (ekg-note-id note)))
                    notes))))
+
+(defun ekg--notes-fill-id-gaps ()
+  "Extend `:ekg-note-id' properties to cover gaps between notes.
+This ensures that every buffer position belongs to a note, so the
+cursor always lands on a note."
+  (let ((pos (point-min)))
+    (while (< pos (point-max))
+      (if (get-text-property pos :ekg-note-id)
+          (setq pos (or (next-single-property-change pos :ekg-note-id)
+                        (point-max)))
+        ;; In a gap — assign it to the preceding note, or the next one
+        ;; if there is no preceding note.
+        (let ((gap-end (or (next-single-property-change pos :ekg-note-id)
+                           (point-max)))
+              (prev-id (and (> pos (point-min))
+                            (get-text-property (1- pos) :ekg-note-id))))
+          (if prev-id
+              (put-text-property pos gap-end :ekg-note-id prev-id)
+            (when-let* ((next-id (get-text-property gap-end :ekg-note-id)))
+              (put-text-property pos gap-end :ekg-note-id next-id)))
+          (setq pos gap-end))))))
 
 (defun ekg--notes-mount (name notes-func)
   "Mount a vui notes view with NAME and NOTES-FUNC into the current buffer."
@@ -1977,6 +1997,7 @@ TITLE is the title of the URL to browse to."
           (setq vui--rendering-p nil)))
       (widget-setup)
       (vui--run-pending-effects)
+      (ekg--notes-fill-id-gaps)
       (goto-char (point-min)))
     instance))
 
@@ -1988,10 +2009,10 @@ NAME is displayed at the top of the buffer."
   (setq-local ekg-notes-fetch-notes-function notes-func
               ekg-notes-name name
               ekg-notes-hl (make-overlay 1 1)
-              ekg-notes-tags tags)
+              ekg-notes-tags tags
+              header-line-format (propertize (concat " " name)
+                                             'face 'bold))
   (overlay-put ekg-notes-hl 'face hl-line-face)
-  ;; Move past the title
-  (forward-line 1)
   (ekg--note-highlight)
   (when (eq ekg-capture-default-mode 'org-mode)
     (ekg--notes-activate-links)

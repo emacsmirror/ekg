@@ -76,13 +76,16 @@ Bind this around batch operations that save multiple notes; call
                       ;; case-insensitive, values are strings.
                       '(property :base/type string))
   ;; Mark 'org' as an ekg note type so it's managed with notes
-  (triples-set-type ekg-db 'org 'ekg-note-type)
-  (add-to-list 'ekg-header-hidden-properties :org/parent)
-  (add-to-list 'ekg-header-hidden-properties :org/children)
-  (add-to-list 'ekg-header-hidden-properties :org/sort-order)
-  (add-to-list 'ekg-header-hidden-properties :org/property))
+  (triples-set-type ekg-db 'org 'ekg-note-type))
 
 (add-hook 'ekg-add-schema-hook #'ekg-org-add-schema)
+
+;; These are set at load time rather than in the schema hook, which
+;; only runs on database version changes.
+(add-to-list 'ekg-header-hidden-properties :org/parent)
+(add-to-list 'ekg-header-hidden-properties :org/children)
+(add-to-list 'ekg-header-hidden-properties :org/sort-order)
+(add-to-list 'ekg-header-hidden-properties :org/property)
 
 (defun ekg-org-properties-alist (note)
   "Return the org properties of NOTE as an alist of (KEY . VALUE) pairs.

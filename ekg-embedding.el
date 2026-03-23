@@ -89,8 +89,9 @@ If nil, then we fallback to the default `ekg-db'.")
 (defun ekg-embedding-add-schema ()
   "Add the triples schema for storing embeddings, if we are using the sqlite db."
   (unless ekg-vecdb-provider
-    (triples-add-schema ekg-db 'embedding '(embedding :base/unique t :base/type vector)))
-  (add-to-list 'ekg-header-hidden-properties :embedding/embedding))
+    (triples-add-schema ekg-db 'embedding '(embedding :base/unique t :base/type vector))))
+
+(add-to-list 'ekg-header-hidden-properties :embedding/embedding)
 
 (defun ekg-remove-sqlite-embeddings ()
   "Remove all embeddings from the SQLite database.
