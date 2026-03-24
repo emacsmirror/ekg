@@ -762,7 +762,7 @@ non-string content in the assistant role."
 (defconst ekg-agent-tool-summarize-state
   (make-llm-tool :function #'ekg-agent--summarize-state
                  :name "summarize_state"
-                 :description "Summarize the current state in the agent log window.  This should be called often to keep the user up to date on what is happening."
+                 :description "Summarize the current state in the agent log window.  This should be called often to keep the user up to date on what is happening, around every few tool calls."
                  :args '((:name "state" :type string :description "Short summary of current progress, plan, or blockers."))))
 
 (defconst ekg-agent-tool-read-agents-md
@@ -1638,11 +1638,13 @@ Before you begin any substantive work on a task:
      will be the source of information if we need to recover the state
      of the work in progress.
 
-3. **DOCUMENT PROGRESS THROUGHOUT THE TASK**
+3. **DOCUMENT PROGRESS AND UPDATE THE USER THROUGHOUT THE TASK**
    - Before you start significant work: add an entry describing what you plan to do.
    - When you discover important information: add a note about it.
    - When you hit a problem or make a decision: document the rationale.
    - Be specific: include file paths, code snippets, key insights, and context.
+   - Be sure and call the state summarization tool regularly, so that
+     the user understands the state of the work.
 
 4. **CREATE SKILL NOTES FOR REUSABLE KNOWLEDGE**
    Any time you discover something generally useful — a pattern,
