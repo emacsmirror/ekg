@@ -778,7 +778,7 @@ re-rendering and ensure it is visible."
             (dolist (win (window-list nil 'no-mini))
               (when-let* ((entry (assq (current-buffer)
                                        (window-prev-buffers win))))
-                (setcar (cddr entry) (point))))))
+                (setcar (cddr entry) (point-marker))))))
       (goto-char (point-min))
       (ekg-org-view--ensure-on-heading))
     (ekg-org-view--highlight)))
