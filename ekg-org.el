@@ -355,13 +355,13 @@ ARGS are additional arguments to the operation."
                       (string-match ".*archive" filename)))
             (replace (nth 4 args)))
         (if replace
-            (let ((temp-buf (generate-new-buffer " *ekg-temp*")))
-              (unwind-protect
-                  (progn
-                    (with-current-buffer temp-buf
-                      (insert content))
-                    (replace-buffer-contents temp-buf))
-                (kill-buffer temp-buf)))
+            (let ((temp-file (make-temp-file "ekg-org-")))
+              (write-region content nil temp-file nil 'silent)
+              (let ((inhibit-file-name-handlers
+                     (cons 'ekg-org-fs-handler inhibit-file-name-handlers))
+                    (inhibit-file-name-operation 'insert-file-contents))
+                (insert-file-contents temp-file nil nil nil t))
+              (delete-file temp-file))
           (insert content))
         (setq-local buffer-file-name filename)
         ;; Return value must be (filename size)
