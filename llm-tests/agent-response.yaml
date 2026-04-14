@@ -1,0 +1,19 @@
+group: agent response
+setup: |
+  ekg is already initialized in this Emacs: a temp database is connected,
+  `ekg', `ekg-agent', and `ekg-llm' are loaded, and `ekg-llm-provider' is
+  configured.  You do not need to require any libraries or set up the
+  database; just call ekg commands directly.
+
+
+tests:
+  - description: |
+      Create an ekg note by calling `ekg-capture`.  Write the contents of the
+      note: "The secret password is Orion".  Finish the note.  Call
+      `ekg-show-notes-latest-captured` and verify your note is there.
+
+      Then, create a new note by calling `ekg-capture` again.  In the note,
+      write "What was the secret password I wrote about?" and then press "C-c
+      .".  Wait for a response - in a minute there should be a response that
+      correctly says the secret password is Orion.
+      

@@ -77,6 +77,70 @@
                  (ekg-agent--with-error-as-text
                    (+ 40 2)))))
 
+(ert-deftest ekg-agent-test-status-reminder-adds-prompt-when-overdue ()
+  "An overdue session gets a prompt reminder to summarize state."
+  (let ((buf (get-buffer-create "*ekg-agent-test-reminder*"))
+        (prompt (llm-make-chat-prompt "Work on the task."))
+        (ekg-agent-status-reminder-seconds 60)
+        (ekg-agent--current-log-buffer nil))
+    (unwind-protect
+        (let ((ekg-agent--current-log-buffer buf))
+          (with-current-buffer buf
+            (setq ekg-agent--running-p t)
+            (setq ekg-agent--last-status-update-time 100.0)
+            (setq ekg-agent--last-status-reminder-time nil))
+          (cl-letf (((symbol-function 'float-time)
+                     (lambda (&optional _time) 161.0)))
+            (should (ekg-agent--maybe-remind-status-update prompt)))
+          (with-current-buffer buf
+            (should (= 161.0 ekg-agent--last-status-reminder-time)))
+          (let* ((interactions (llm-chat-prompt-interactions prompt))
+                 (last-message
+                  (llm-chat-prompt-interaction-content (car (last interactions)))))
+            (should (string-match-p "summarize_state" last-message))
+            (should (string-match-p "what you finished" last-message))))
+      (kill-buffer buf))))
+
+(ert-deftest ekg-agent-test-status-reminder-skips-recent-status ()
+  "A recent status update does not add another reminder."
+  (let ((buf (get-buffer-create "*ekg-agent-test-no-reminder*"))
+        (prompt (llm-make-chat-prompt "Work on the task."))
+        (ekg-agent-status-reminder-seconds 60)
+        (ekg-agent--current-log-buffer nil))
+    (unwind-protect
+        (let ((ekg-agent--current-log-buffer buf))
+          (with-current-buffer buf
+            (setq ekg-agent--running-p t)
+            (setq ekg-agent--last-status-update-time 100.0)
+            (setq ekg-agent--last-status-reminder-time nil))
+          (cl-letf (((symbol-function 'float-time)
+                     (lambda (&optional _time) 150.0)))
+            (should-not (ekg-agent--maybe-remind-status-update prompt)))
+          (should (= 1 (length (llm-chat-prompt-interactions prompt))))
+          (with-current-buffer buf
+            (should-not ekg-agent--last-status-reminder-time)))
+      (kill-buffer buf))))
+
+(ert-deftest ekg-agent-test-status-reminder-repeats-if-ignored ()
+  "If the model ignores a reminder, another one is sent later."
+  (let ((buf (get-buffer-create "*ekg-agent-test-repeat-reminder*"))
+        (prompt (llm-make-chat-prompt "Work on the task."))
+        (ekg-agent-status-reminder-seconds 60)
+        (ekg-agent--current-log-buffer nil))
+    (unwind-protect
+        (let ((ekg-agent--current-log-buffer buf))
+          (with-current-buffer buf
+            (setq ekg-agent--running-p t)
+            (setq ekg-agent--last-status-update-time 100.0)
+            (setq ekg-agent--last-status-reminder-time 161.0))
+          (cl-letf (((symbol-function 'float-time)
+                     (lambda (&optional _time) 221.0)))
+            (should (ekg-agent--maybe-remind-status-update prompt)))
+          (should (= 2 (length (llm-chat-prompt-interactions prompt))))
+          (with-current-buffer buf
+            (should (= 221.0 ekg-agent--last-status-reminder-time))))
+      (kill-buffer buf))))
+
 ;; Line ID generation
 
 (ert-deftest ekg-agent-test-line-ids-unique ()
@@ -128,6 +192,65 @@
                   (let ((result (ekg-agent--read-file path)))
                     (should (string-match-p "buffer content" result))))
               (kill-buffer buf))))
+      (delete-file path))))
+
+(ert-deftest ekg-agent-test-read-file-empty-string-args ()
+  "Empty strings for begin/end/range-type are treated as nil."
+  (let ((path (make-temp-file "ekg-agent-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "alpha\nbeta\ngamma\n"))
+          (let ((full (ekg-agent--read-file path))
+                (empty-args (ekg-agent--read-file path "" "" "line_number")))
+            (should (string= full empty-args))
+            (should (string-match-p "alpha" full))
+            (should (string-match-p "gamma" full))))
+      (delete-file path))))
+
+(ert-deftest ekg-agent-test-write-file-creates-new ()
+  "write_file creates a new file and returns content with line ids."
+  (let ((path (concat (make-temp-file "ekg-agent-test" t) "/new-file.txt")))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p path))
+          (let ((result (ekg-agent--write-file path "hello\nworld\n")))
+            (should (file-exists-p path))
+            (should (string-match-p "hello" result))
+            (should (string-match-p "world" result))
+            (should (equal "hello\nworld\n"
+                           (with-temp-buffer
+                             (insert-file-contents path)
+                             (buffer-string))))))
+      (when (file-exists-p path)
+        (delete-file path)))))
+
+(ert-deftest ekg-agent-test-write-file-overwrites-existing ()
+  "write_file replaces the content of an existing file."
+  (let ((path (make-temp-file "ekg-agent-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "old content\n"))
+          (ekg-agent--write-file path "new content\n")
+          (should (equal "new content\n"
+                         (with-temp-buffer
+                           (insert-file-contents path)
+                           (buffer-string)))))
+      (delete-file path))))
+
+(ert-deftest ekg-agent-test-write-file-updates-buffer ()
+  "write_file updates an open buffer instead of writing to disk."
+  (let ((path (make-temp-file "ekg-agent-test")))
+    (unwind-protect
+        (let ((buf (find-file-noselect path)))
+          (unwind-protect
+              (progn
+                (ekg-agent--write-file path "buffer content\n")
+                (should (equal "buffer content\n"
+                               (with-current-buffer buf
+                                 (buffer-substring-no-properties
+                                  (point-min) (point-max))))))
+            (kill-buffer buf)))
       (delete-file path))))
 
 (ert-deftest ekg-agent-test-edit-file-round-trip ()
@@ -292,6 +415,43 @@ result when the agent finishes."
   (let ((notes (ekg-get-notes-with-tags '("test-tag"))))
     (should (= 1 (length notes)))
     (should (string-match-p "Test note content" (ekg-note-text (car notes))))))
+
+(ekg-deftest ekg-agent-test-append-to-note ()
+  "Appending to a note adds content without log contamination."
+  (let* ((note (ekg-note-create :text "Original content."
+                                :mode 'org-mode
+                                :tags '("append-test")))
+         (_ (ekg-save-note note))
+         (note-id (format "%s" (ekg-note-id note))))
+    (ekg-agent-test--with-mock-agent
+        (list
+         ;; Iteration 1: append to the note
+         (list (cons "append_to_note"
+                     (list note-id "Appended paragraph.")))
+         ;; Iteration 2: append more
+         (list (cons "append_to_note"
+                     (list note-id "Second appended paragraph.")))
+         ;; Iteration 3: done
+         (list (cons "end" nil)))
+      (ekg-agent--iterate
+       (llm-make-chat-prompt
+        "Test: append to a note."
+        :tools (append ekg-agent-base-tools
+                       (list ekg-agent-tool-end))
+        :tool-options (make-llm-tool-options :tool-choice 'any))
+       0
+       (lambda (status) (setq done-flag status))
+       '("end")))
+    (let* ((updated (ekg-get-note-with-id (ekg-note-id note)))
+           (text (ekg-note-text updated)))
+      (should (string-match-p "Original content" text))
+      (should (string-match-p "Appended paragraph" text))
+      (should (string-match-p "Second appended paragraph" text))
+      ;; Agent log artifacts must not leak into the note.
+      (should-not (string-match-p "STARTED" text))
+      (should-not (string-match-p " DONE " text))
+      (should-not (string-match-p "Waiting for LLM" text))
+      (should-not (string-match-p "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}" text)))))
 
 (ert-deftest ekg-agent-test-agent-run-command ()
   "The run_command tool executes a shell command and returns output."

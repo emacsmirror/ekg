@@ -534,6 +534,11 @@ if it is time for one, according to the settings in
       ;; Note that we recalculate modified time here, since we are modifying the
       ;; entity.
       (let ((modified-time (time-convert (current-time) 'integer)))
+        ;; Ensure creation-time is set; it may be nil if the note was
+        ;; retrieved from a DB that lacks the time-tracked type for
+        ;; this note (e.g., notes created by external tools).
+        (unless (ekg-note-creation-time note)
+          (setf (ekg-note-creation-time note) modified-time))
         (triples-set-type ekg-db (ekg-note-id note) 'time-tracked
                           :creation-time (ekg-note-creation-time note)
                           :modified-time modified-time)
@@ -2035,7 +2040,7 @@ cursor always lands on a note."
 (defun ekg--notes-mount (name notes-func)
   "Mount a vui notes view with NAME and NOTES-FUNC into the current buffer."
   (let* ((vnode (vui-component 'ekg-notes-root
-                               :name name :notes-func notes-func))
+                  :name name :notes-func notes-func))
          (instance (vui--create-instance vnode nil))
          (vui--pending-effects nil))
     (setf (vui-instance-buffer instance) (current-buffer))
